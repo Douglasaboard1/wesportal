@@ -11,11 +11,20 @@ Run: python3 validate_excel.py   (takes several minutes — 14k formulas + circu
 """
 import warnings, time
 warnings.filterwarnings("ignore")
+from dataclasses import replace
 import formulas
 from openpyxl import load_workbook
 from solve_and_test import Inputs, engine, xirr
 
 WB = "MixedUse_Acquisition_Model.xlsx"
+
+# The `formulas` library cannot do iterative (circular) calculation — it zeros any cell in
+# a cycle (proven on an isolated 3-cell test). The model's ONLY structural cycle is the
+# financing-cost <-> loan loop (spec-intended, handled by Excel's iterative calc). We break
+# that single reference (financing cost -> constant 0) so the workbook becomes acyclic and
+# the library can evaluate it, then compare to a replica run with finance cost = 0. This
+# independently validates the entire (large) acyclic machinery; the financing-cost term
+# itself is just loan x 1% and is checked separately by the replica.
 
 
 def named_addr(wb, name):
@@ -39,13 +48,18 @@ def find(sol, sheet, coord):
 def main():
     t0 = time.time()
     wb = load_workbook(WB)
-    print("Loading workbook into the formulas engine (several minutes)...")
-    xl = formulas.ExcelModel().loads(WB).finish(circular=True)
+    # break the single financing-cost <-> loan cycle so the workbook is acyclic
+    sh, coord = named_addr(wb, "FinancingCosts")
+    wb[sh][coord] = 0
+    TMP = "MixedUse_validation_acyclic.xlsx"
+    wb.save(TMP)
+    print("Loading acyclic validation copy into the formulas engine (several minutes)...")
+    xl = formulas.ExcelModel().loads(TMP).finish(circular=False)
     sol = xl.calculate()
     print(f"Evaluated {len(sol)} cells in {time.time()-t0:.0f}s\n")
 
     base = Inputs()
-    e = engine(base, base.input_price)   # PriceMode defaults to Input Price = $48M
+    e = engine(replace(base, finance_cost_pct=0.0), base.input_price)   # match: fin cost = 0
     wf = e["wf"]
 
     # name -> replica value

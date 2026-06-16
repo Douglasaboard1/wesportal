@@ -1371,32 +1371,21 @@ AR_LCF = annual_row("Levered CF", MC_LCF)
 # We approximate using last 12 active months (trailing) and StabNOI grown (forward).
 r2 = asm.max_row + 2
 subhead(asm, r2, "Derived exit & cost metrics", 1, 6); r2 += 1
+# Trailing-12 window: sum a Monthly-CF row over the 12 months ending at disposition.
+# SUMIFS (not SUMPRODUCT(--)) — cleaner, and portable to any Excel evaluator.
+def trail12(sum_row):
+    sr = f"{q('Monthly CF')}!{mcol(0)}${sum_row}:{mcol(MAX_MONTHS-1)}${sum_row}"
+    ir = f"{q(ASM)}!{mcol(0)}${PERIOD_IDX_ROW}:{mcol(MAX_MONTHS-1)}${PERIOD_IDX_ROW}"
+    return f'SUMIFS({sr},{ir},">"&(HoldMonths-12),{ir},"<="&HoldMonths)'
+
 put(asm, r2, 1, "Trailing 12-mo exit NOI ($)", role="form")
-# trailing: sum of NOI over the 12 months up to and including exit -> use SUMPRODUCT with exit window
-# Simpler robust proxy: trailing = stabilized annualized * cum growth to exit year.
-put(asm, r2, 2, f"=SUMPRODUCT({q('Monthly CF')}!{mcol(0)}${MC_NOI}:{mcol(MAX_MONTHS-1)}${MC_NOI},"
-                f"{q(ASM)}!{mcol(0)}${EXIT_FLAG_ROW}:{mcol(MAX_MONTHS-1)}${EXIT_FLAG_ROW})",
-    role="link", nf=NF_USD0)
-# above gives only exit-month NOI; build proper trailing using offset sum:
-TRAIL_ROW = r2
-put(asm, r2, 2,
-    f"=SUMPRODUCT(({q('Monthly CF')}!{mcol(0)}${MC_NOI}:{q('Monthly CF')}!{mcol(MAX_MONTHS-1)}${MC_NOI}),"
-    f"--({q(ASM)}!{mcol(0)}${PERIOD_IDX_ROW}:{q(ASM)}!{mcol(MAX_MONTHS-1)}${PERIOD_IDX_ROW}>HoldMonths-12),"
-    f"--({q(ASM)}!{mcol(0)}${PERIOD_IDX_ROW}:{q(ASM)}!{mcol(MAX_MONTHS-1)}${PERIOD_IDX_ROW}<=HoldMonths))",
-    role="link", nf=NF_USD0, name="ExitNOI_Trailing"); r2 += 1
+put(asm, r2, 2, "=" + trail12(MC_NOI), role="link", nf=NF_USD0, name="ExitNOI_Trailing"); r2 += 1
 put(asm, r2, 1, "Forward 12-mo exit NOI ($)", role="form")
 put(asm, r2, 2, "=ExitNOI_Trailing*(1+INDEX(Vec_MFRent,1,1))", role="form", nf=NF_USD0, name="ExitNOI_Forward"); r2 += 1
 put(asm, r2, 1, "Exit NOI (basis-selected) ($)", role="form")
 put(asm, r2, 2, '=IF(ExitNOIBasis="Trailing 12-mo",ExitNOI_Trailing,ExitNOI_Forward)', role="form", nf=NF_USD0, name="ExitNOI"); r2 += 1
-# MF/Retail split for component caps (approx via EGI share applied to NOI)
-put(asm, r2, 1, "MF NOI share (exit, approx)", role="form")
-put(asm, r2, 2,
-    f"=SUMPRODUCT({q('Monthly CF')}!{mcol(0)}${MC_MFEGI}:{q('Monthly CF')}!{mcol(MAX_MONTHS-1)}${MC_MFEGI},"
-    f"--({q(ASM)}!{mcol(0)}${PERIOD_IDX_ROW}:{q(ASM)}!{mcol(MAX_MONTHS-1)}${PERIOD_IDX_ROW}>HoldMonths-12),"
-    f"--({q(ASM)}!{mcol(0)}${PERIOD_IDX_ROW}:{q(ASM)}!{mcol(MAX_MONTHS-1)}${PERIOD_IDX_ROW}<=HoldMonths))/"
-    f"MAX(1,SUMPRODUCT(({q('Monthly CF')}!{mcol(0)}${MC_MFEGI}:{q('Monthly CF')}!{mcol(MAX_MONTHS-1)}${MC_MFEGI}+{q('Monthly CF')}!{mcol(0)}${MC_RTEGI}:{q('Monthly CF')}!{mcol(MAX_MONTHS-1)}${MC_RTEGI}),"
-    f"--({q(ASM)}!{mcol(0)}${PERIOD_IDX_ROW}:{q(ASM)}!{mcol(MAX_MONTHS-1)}${PERIOD_IDX_ROW}>HoldMonths-12),"
-    f"--({q(ASM)}!{mcol(0)}${PERIOD_IDX_ROW}:{q(ASM)}!{mcol(MAX_MONTHS-1)}${PERIOD_IDX_ROW}<=HoldMonths)))",
+put(asm, r2, 1, "MF NOI share (exit, by EGI)", role="form")
+put(asm, r2, 2, f"={trail12(MC_MFEGI)}/MAX(1,{trail12(MC_MFEGI)}+{trail12(MC_RTEGI)})",
     role="link", nf=NF_PCT, name="MF_NOI_Share"); r2 += 1
 put(asm, r2, 1, "Exit gross value ($)", role="form")
 put(asm, r2, 2,

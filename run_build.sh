@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Phase-1 build pipeline: write the workbook, then run the Python solver + Section 8 tests.
+# Full pipeline: build scaffold -> solve max-bid + run Section 8 tests -> Phase 2 finish.
 set -e
 python3 build_model.py
 python3 solve_and_test.py
+python3 phase2_finish.py

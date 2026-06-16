@@ -13,7 +13,8 @@ interactive Goal-Seek solver, conditional formatting, and print polish.
 | `model_inputs.py` | **Single source of truth** — sample rent rolls, growth vectors, recovery matrix, and all default assumptions. Imported by both scripts so the live Excel model and the numeric replica can never drift. |
 | `build_model.py` | Writes `MixedUse_Acquisition_Model.xlsx`: 13 tabs, every formula as a real cell-formula string, 178 named ranges, fonts by role, iterative calc on. |
 | `solve_and_test.py` | A reduced-form numeric replica of the engine used to (1) binary-search the max-bid price and write it into the `SolvedPrice` cell, and (2) run the Section 8 assertions + a structural validation of the workbook. |
-| `run_build.sh` | Runs the two scripts in order (build, then solve+test). |
+| `phase2_finish.py` | Phase 2 finishing pass applied with openpyxl: populates the three Sensitivities grids and a max-bid table with computed values, adds conditional formatting on status cells, and sets print areas / fit-to-page / freeze panes. |
+| `run_build.sh` | Runs the three scripts in order (build → solve+test → Phase 2 finish). |
 | `MixedUse_Acquisition_Model.xlsx` | The generated workbook (the Phase-1 deliverable). |
 
 ## Run
@@ -106,18 +107,26 @@ pref: Return of Capital → 8% compounded Preferred (100% to investors) → GP C
 (lookback) method, so they are exact and non-iterative. Edit any input on the
 Waterfall tab to change the structure.
 
-## Known simplifications → Phase 2 (live calc engine required)
+## Phase 2 status (applied by `phase2_finish.py`)
 
-1. **Loss-to-lease, lease-up, and reno ramps** operate at the rent-roll aggregate on
-   the monthly build rather than per-unit-per-month; per-unit detail lives on the rent
-   roll. Setting retail GLA to 0 still yields a clean pure-MF model.
-2. **Sensitivities** tab is the Phase-1 stub (axes + output anchors). The live two-way
-   data tables and Goal-Seek are Phase-2 (native Excel calc engine required).
+Done here, in-workbook:
+- **Sensitivity grids** (all three) populated with **computed values** from the model
+  engine, plus a **max-bid-by-target-IRR** table (the Goal-Seek deliverable, precomputed).
+  Computed cells are coloured purple.
+- **Conditional formatting** on the Summary all-checks flag, the Control Panel model
+  status, and the acceptance-check cells (green = pass, red = fail).
+- **Print areas, fit-to-page, and freeze panes** on every tab.
 
-## Phase 2 handoff (§9.2)
+Still needs real Excel (no live calc engine in the build environment) — see
+`PHASE2_GUIDE.md`:
+- Convert the **snapshot grids into live two-way Data Tables** so they recompute when
+  inputs change (input cells are noted under each grid; the written values match what the
+  live tables produce at current inputs).
+- Run **interactive Goal Seek** (Set `LeveredIRR` → To target → By changing `InputPrice`).
+- Confirm **iterative calculation** is enabled and recalculate (F9).
 
-Open the workbook, confirm iterative calc is on, then: build the native two-way data
-tables (row/column input cells are documented on the Sensitivities tab), add the
-Goal-Seek price solver (Set `LeveredIRR` → To target → By changing `InputPrice`),
-apply conditional formatting to the model-status and binding-constraint flags, set the
-IC one-pager print area, and re-run the Section 8 checks visually.
+## Remaining model simplification
+
+**Loss-to-lease, lease-up, and reno ramps** operate at the rent-roll aggregate on the
+monthly build rather than per-unit-per-month; per-unit detail lives on the rent roll.
+Setting retail GLA to 0 still yields a clean pure-MF model.

@@ -745,9 +745,13 @@ for i in range(MAX_MONTHS):
         cam = f"VLOOKUP({struct_ref},RecovMatrix,2,FALSE)*RecovCAM"
         tax = f"VLOOKUP({struct_ref},RecovMatrix,3,FALSE)*RecovTax"
         ins = f"VLOOKUP({struct_ref},RecovMatrix,4,FALSE)*RecovIns"
-        pool = f"({cam}+{tax}+{ins})*{sf_ref}/12*{cf}"
+        stop = f"VLOOKUP({struct_ref},RecovMatrix,5,FALSE)"      # 1 = base-year expense stop (Modified Gross)
+        base = f"({cam}+{tax}+{ins})*{sf_ref}/12"               # recoverable pool $/mo (yr-0 dollars)
         adminmult = f"(1+IF(AdminFeeOn=\"On\",AdminFeePct,0))"
-        parts.append(f"{pool}*{adminmult}")
+        grossup = f"IF(GrossUpOn=\"On\",1/(1-RetailGenVacancy),1)"   # gross expenses to full occupancy
+        # NNN/Gross reimburse grown pool; Modified Gross reimburses only growth above the base year (cf-1)
+        escalation = f"IF({stop}=1,MAX(0,{cf}-1),{cf})"
+        parts.append(f"{base}*{grossup}*{adminmult}*{escalation}")
     put(rt, mrow, M0 + i, f"=({'+'.join(parts)})*{act}", role="form", nf=NF_USD0)
 mrow += 1
 
@@ -864,7 +868,23 @@ add_name("OX_Resv_Row", ox.title, f"${mcol(0)}${OX_RESV_ROW}")
 tx = wb.create_sheet("Taxes")
 banner(tx, "REAL ESTATE TAXES", 14)
 tx.column_dimensions["A"].width = 34
-mrow = 5
+
+# PILOT / Abatement: user year-by-year schedule (annual $ by hold year)
+r = 5
+subhead(tx, r, "PILOT / Abatement schedule (annual $ by hold year; used when Tax Method = PILOT)", 1, 14); r += 1
+put(tx, r, 1, "Hold year", role="sub")
+for y in range(1, 12):
+    put(tx, r, 4 + y, y, role="sub", align="center")
+r += 1
+put(tx, r, 1, "PILOT annual tax ($)", role="form")
+PILOT_ROW = r
+pilot_sched = [200_000, 250_000, 300_000, 350_000, 400_000, 450_000, 500_000, 550_000, 600_000, 650_000, 700_000]
+for y in range(11):
+    put(tx, r, 5 + y, pilot_sched[y], role="input", nf=NF_USD0, fill=FILL_INPUT)
+add_name("PILOTSchedule", tx.title, f"${get_column_letter(5)}${r}:${get_column_letter(15)}${r}")
+r += 2
+
+mrow = r
 subhead(tx, mrow, "MONTHLY TAX BUILD (method per toggle #13)", 1, 14); mrow += 1
 put(tx, mrow, 1, "Month index", role="sub")
 for i in range(MAX_MONTHS):
@@ -877,7 +897,7 @@ for i in range(MAX_MONTHS):
     yr = f"{q(ASM)}!{col}${HOLD_YEAR_ROW}"
     flat = f"BaseAnnualTax*(1+TaxFlatGrowth)^(MAX({yr}-1,0))"
     reass = f"PurchasePrice*AssessRatio*MillRate*(1+TaxFlatGrowth)^(MAX({yr}-1,0))"
-    pilot = f"PILOTAnnualTax"
+    pilot = f"INDEX(PILOTSchedule,1,MIN(MAX({yr},1),11))"   # year-by-year abatement schedule
     put(tx, mrow, M0 + i,
         f'=IF(TaxMethod="Flat Growth",{flat},IF(TaxMethod="PILOT / Abatement",{pilot},{reass}))',
         role="form", nf=NF_USD0)
@@ -946,6 +966,18 @@ for i in range(MAX_MONTHS):
         parts.append(f"IF(AND({idx}>=$D${rr},{idx}<$D${rr}+$E${rr}),$B${rr}/$E${rr},0)")
     put(cx, mrow, M0 + i, f"=-({'+'.join(parts)})", role="form", nf=NF_USD0)
 mrow += 1
+# Financed portion of monthly capital spend -> drawn from the loan holdback as spent (pro-rata)
+put(cx, mrow, 1, "Financed capital draw ($/mo, +)", role="form")
+CX_FINDRAW_ROW = mrow
+for i in range(MAX_MONTHS):
+    col = mcol(i); idx = f"{q(ASM)}!{col}${PERIOD_IDX_ROW}"
+    parts = []
+    for k in range(len(buckets)):
+        rr = CB0 + k
+        parts.append(f'IF(AND({idx}>=$D${rr},{idx}<$D${rr}+$E${rr},$C${rr}="Financed"),$B${rr}/$E${rr},0)')
+    put(cx, mrow, M0 + i, f"=({'+'.join(parts)})", role="form", nf=NF_USD0)
+mrow += 1
+add_name("CX_FinDraw_Row", cx.title, f"${mcol(0)}${CX_FINDRAW_ROW}")
 put(cx, mrow, 1, "Retail rollover TI/LC ($/mo, neg)", role="form")
 CX_TILC_ROW = mrow
 for i in range(MAX_MONTHS):
@@ -967,138 +999,210 @@ add_name("CX_Tot_Row", cx.title, f"${mcol(0)}${CX_TOT_ROW}")
 # directly from component EGI - opex - taxes.
 # ======================================================================================
 db = wb.create_sheet("Debt")
-banner(db, "DEBT — Acquisition Sizing, Min-of Constraints, Refi", 14)
-db.column_dimensions["A"].width = 36
+banner(db, "DEBT — Sizing (min-of), Single/Separate Loans, Refi", 14)
+db.column_dimensions["A"].width = 40
 for col in "BCD":
     db.column_dimensions[col].width = 16
 
 r = 5
-subhead(db, r, "Loan terms (inputs)", 1, 4); r += 1
+# ---- Blended terms (used as Loan A when Debt Structure = Single Blended Loan) ----
+subhead(db, r, "Blended loan terms (Single Blended Loan mode)", 1, 4); r += 1
 put(db, r, 1, "Max LTV (%)", role="form"); put(db, r, 2, 0.65, role="input", nf=NF_PCT, fill=FILL_INPUT, name="MaxLTV"); r += 1
 put(db, r, 1, "Max LTC (%)", role="form"); put(db, r, 2, 0.70, role="input", nf=NF_PCT, fill=FILL_INPUT, name="MaxLTC"); r += 1
 put(db, r, 1, "Min DSCR (x)", role="form"); put(db, r, 2, 1.25, role="input", nf=NF_MULT, fill=FILL_INPUT, name="MinDSCR"); r += 1
 put(db, r, 1, "Min Debt Yield (%)", role="form"); put(db, r, 2, 0.085, role="input", nf=NF_PCT, fill=FILL_INPUT, name="MinDebtYield"); r += 1
 put(db, r, 1, "Fixed rate (%)", role="form"); put(db, r, 2, D["fixed_rate"], role="input", nf=NF_PCT2, fill=FILL_INPUT, name="FixedRate"); r += 1
-put(db, r, 1, "SOFR (%)", role="form"); put(db, r, 2, 0.043, role="input", nf=NF_PCT2, fill=FILL_INPUT, name="SOFR"); r += 1
-put(db, r, 1, "Spread (bps)", role="form"); put(db, r, 2, 250, role="input", nf=NF_BPS, fill=FILL_INPUT, name="SpreadBps"); r += 1
+put(db, r, 1, "SOFR (%)", role="form"); put(db, r, 2, D["sofr"], role="input", nf=NF_PCT2, fill=FILL_INPUT, name="SOFR"); r += 1
+put(db, r, 1, "Spread (bps)", role="form"); put(db, r, 2, D["spread_bps"], role="input", nf=NF_BPS, fill=FILL_INPUT, name="SpreadBps"); r += 1
 put(db, r, 1, "All-in rate (%)", role="form")
 put(db, r, 2, '=IF(LoanRateType="Fixed",FixedRate,SOFR+SpreadBps/10000)', role="form", nf=NF_PCT2, name="LoanRate"); r += 1
-put(db, r, 1, "IO period (months)", role="form"); put(db, r, 2, 36, role="input", nf=NF_MO, fill=FILL_INPUT, name="IOMonths"); r += 1
-put(db, r, 1, "Amortization (years)", role="form"); put(db, r, 2, 30, role="input", nf=NF_NUM, fill=FILL_INPUT, name="AmortYears"); r += 1
-put(db, r, 1, "Financing cost (% of loan)", role="form"); put(db, r, 2, 0.01, role="input", nf=NF_PCT, fill=FILL_INPUT, name="FinanceCostPct"); r += 2
-
-# Stabilized NOI proxy (forward 12mo near stabilization) for sizing
-subhead(db, r, "Sizing inputs (NOI & value)", 1, 4); r += 1
-put(db, r, 1, "Stabilized annual NOI ($) [from CF]", role="form")
-# reference Monthly CF NOI row (defined later); we will set after building CF. Use SUM of months 13-24 as proxy.
-DB_STAB_NOI = r
-put(db, r, 2, 0, role="form", nf=NF_USD0, name="StabNOI"); r += 1   # filled after CF built
-put(db, r, 1, "Going-in annual NOI ($) [yr1 from CF]", role="form")
-DB_GOINGIN_NOI = r
-put(db, r, 2, 0, role="form", nf=NF_USD0, name="GoingInNOI"); r += 1
-put(db, r, 1, "Annual debt constant (amortizing)", role="form")
+put(db, r, 1, "IO period (months)", role="form"); put(db, r, 2, D["io_months"], role="input", nf=NF_MO, fill=FILL_INPUT, name="IOMonths"); r += 1
+put(db, r, 1, "Amortization (years)", role="form"); put(db, r, 2, D["amort_years"], role="input", nf=NF_NUM, fill=FILL_INPUT, name="AmortYears"); r += 1
+put(db, r, 1, "Financing cost (% of loan)", role="form"); put(db, r, 2, D["finance_cost_pct"], role="input", nf=NF_PCT, fill=FILL_INPUT, name="FinanceCostPct"); r += 1
+put(db, r, 1, "Blended debt constant", role="form")
 put(db, r, 2, "=LoanRate/12/(1-(1+LoanRate/12)^(-AmortYears*12))*12", role="form", nf=NF_PCT2, name="DebtConstant"); r += 2
 
-subhead(db, r, "Max loan under each active constraint (min-of binds)", 1, 6); r += 1
-put(db, r, 1, "Max loan — LTV", role="form")
-put(db, r, 2, '=IF(Use_LTV="On",PurchasePrice*MaxLTV,1E15)', role="form", nf=NF_USD0, name="Loan_LTV"); r += 1
-put(db, r, 1, "Max loan — LTC", role="form")
-put(db, r, 2, '=IF(Use_LTC="On",TotalCost*MaxLTC,1E15)', role="form", nf=NF_USD0, name="Loan_LTC"); r += 1
-put(db, r, 1, "Max loan — DSCR", role="form")
-put(db, r, 2, '=IF(Use_DSCR="On",GoingInNOI/(MinDSCR*DebtConstant),1E15)', role="form", nf=NF_USD0, name="Loan_DSCR"); r += 1
-put(db, r, 1, "Max loan — Debt Yield", role="form")
-put(db, r, 2, '=IF(Use_DY="On",GoingInNOI/MinDebtYield,1E15)', role="form", nf=NF_USD0, name="Loan_DY"); r += 1
-put(db, r, 1, "Loan amount (MIN of active)", role="sub")
-put(db, r, 2, '=MIN(Loan_LTV,Loan_LTC,Loan_DSCR,Loan_DY)+FinancedCapBudget', role="form", nf=NF_USD0, bold=True, name="LoanAmount"); r += 1
-put(db, r, 1, "Binding constraint", role="form")
-put(db, r, 2, '=IF(LoanAmount-FinancedCapBudget=Loan_LTV,"LTV",IF(LoanAmount-FinancedCapBudget=Loan_LTC,"LTC",IF(LoanAmount-FinancedCapBudget=Loan_DSCR,"DSCR","Debt Yield")))',
-    role="form", bold=True, name="BindingConstraint"); r += 1
-put(db, r, 1, "Financing costs ($)", role="form")
-put(db, r, 2, "=LoanAmount*FinanceCostPct", role="form", nf=NF_USD0, name="FinancingCosts"); r += 2
+# ---- Per-leg terms for Separate MF + Retail loans (each its own structure) ----
+def leg_terms(prefix, title, rate_default):
+    global r
+    subhead(db, r, title, 1, 4); r += 1
+    put(db, r, 1, "Max LTV (%)", role="form"); put(db, r, 2, 0.65, role="input", nf=NF_PCT, fill=FILL_INPUT, name=prefix+"_MaxLTV"); r += 1
+    put(db, r, 1, "Max LTC (%)", role="form"); put(db, r, 2, 0.70, role="input", nf=NF_PCT, fill=FILL_INPUT, name=prefix+"_MaxLTC"); r += 1
+    put(db, r, 1, "Min DSCR (x)", role="form"); put(db, r, 2, 1.25, role="input", nf=NF_MULT, fill=FILL_INPUT, name=prefix+"_MinDSCR"); r += 1
+    put(db, r, 1, "Min Debt Yield (%)", role="form"); put(db, r, 2, 0.085, role="input", nf=NF_PCT, fill=FILL_INPUT, name=prefix+"_MinDY"); r += 1
+    put(db, r, 1, "Rate type (Fixed/Floating)", role="form"); put(db, r, 2, "Fixed", role="input", fill=FILL_TOG, name=prefix+"_RateType"); r += 1
+    put(db, r, 1, "Fixed rate (%)", role="form"); put(db, r, 2, rate_default, role="input", nf=NF_PCT2, fill=FILL_INPUT, name=prefix+"_FixedRate"); r += 1
+    put(db, r, 1, "SOFR (%)", role="form"); put(db, r, 2, D["sofr"], role="input", nf=NF_PCT2, fill=FILL_INPUT, name=prefix+"_SOFR"); r += 1
+    put(db, r, 1, "Spread (bps)", role="form"); put(db, r, 2, D["spread_bps"], role="input", nf=NF_BPS, fill=FILL_INPUT, name=prefix+"_Spread"); r += 1
+    put(db, r, 1, "All-in rate (%)", role="form")
+    put(db, r, 2, f'=IF({prefix}_RateType="Fixed",{prefix}_FixedRate,{prefix}_SOFR+{prefix}_Spread/10000)', role="form", nf=NF_PCT2, name=prefix+"_Rate"); r += 1
+    put(db, r, 1, "IO period (months)", role="form"); put(db, r, 2, D["io_months"], role="input", nf=NF_MO, fill=FILL_INPUT, name=prefix+"_IO"); r += 1
+    put(db, r, 1, "Amortization (years)", role="form"); put(db, r, 2, D["amort_years"], role="input", nf=NF_NUM, fill=FILL_INPUT, name=prefix+"_Amort"); r += 1
+    put(db, r, 1, "Financing cost (% of loan)", role="form"); put(db, r, 2, D["finance_cost_pct"], role="input", nf=NF_PCT, fill=FILL_INPUT, name=prefix+"_FinPct"); r += 1
+    put(db, r, 1, "Debt constant", role="form")
+    put(db, r, 2, f"={prefix}_Rate/12/(1-(1+{prefix}_Rate/12)^(-{prefix}_Amort*12))*12", role="form", nf=NF_PCT2, name=prefix+"_DebtConstant"); r += 2
 
-# Refi block
-subhead(db, r, "Refi (toggle #5)", 1, 4); r += 1
-put(db, r, 1, "Refi month", role="form"); put(db, r, 2, 36, role="input", nf=NF_MO, fill=FILL_INPUT, name="RefiMonth"); r += 1
-put(db, r, 1, "Refi cap on stabilized value (%)", role="form"); put(db, r, 2, 0.055, role="input", nf=NF_PCT2, fill=FILL_INPUT, name="RefiCap"); r += 1
-put(db, r, 1, "Refi LTV (%)", role="form"); put(db, r, 2, 0.65, role="input", nf=NF_PCT, fill=FILL_INPUT, name="RefiLTV"); r += 1
-put(db, r, 1, "Refi cost (% of new loan)", role="form"); put(db, r, 2, 0.01, role="input", nf=NF_PCT, fill=FILL_INPUT, name="RefiCostPct"); r += 1
+leg_terms("MFLoan", "MF loan terms (Separate mode)", 0.0560)
+leg_terms("RTLoan", "Retail loan terms (Separate mode)", 0.0625)
+
+# ---- Component NOI / value / cost (placeholders filled after Monthly CF is built) ----
+subhead(db, r, "Sizing inputs — NOI, value, cost (component split drives Separate mode)", 1, 6); r += 1
+put(db, r, 1, "Going-in NOI — total ($)", role="form"); DB_GOINGIN_NOI = r
+put(db, r, 2, 0, role="form", nf=NF_USD0, name="GoingInNOI"); r += 1
+put(db, r, 1, "Stabilized NOI — total ($)", role="form"); DB_STAB_NOI = r
+put(db, r, 2, 0, role="form", nf=NF_USD0, name="StabNOI"); r += 1
+put(db, r, 1, "Going-in NOI — MF ($)", role="form"); DB_GOINGIN_MF = r
+put(db, r, 2, 0, role="form", nf=NF_USD0, name="GoingInNOI_MF"); r += 1
+put(db, r, 1, "Stabilized NOI — MF ($)", role="form"); DB_STAB_MF = r
+put(db, r, 2, 0, role="form", nf=NF_USD0, name="StabNOI_MF"); r += 1
+put(db, r, 1, "Going-in NOI — Retail ($)", role="form"); DB_GOINGIN_RT = r
+put(db, r, 2, 0, role="form", nf=NF_USD0, name="GoingInNOI_Retail"); r += 1
+put(db, r, 1, "Stabilized NOI — Retail ($)", role="form"); DB_STAB_RT = r
+put(db, r, 2, 0, role="form", nf=NF_USD0, name="StabNOI_Retail"); r += 1
+put(db, r, 1, "MF value (alloc. by going-in NOI share)", role="form")
+put(db, r, 2, "=PurchasePrice*IFERROR(GoingInNOI_MF/GoingInNOI,0)", role="form", nf=NF_USD0, name="Value_MF"); r += 1
+put(db, r, 1, "Retail value (residual)", role="form")
+put(db, r, 2, "=PurchasePrice-Value_MF", role="form", nf=NF_USD0, name="Value_Retail"); r += 1
+put(db, r, 1, "MF cost (alloc. share)", role="form")
+put(db, r, 2, "=TotalCost*IFERROR(GoingInNOI_MF/GoingInNOI,0)", role="form", nf=NF_USD0, name="Cost_MF"); r += 1
+put(db, r, 1, "Retail cost (residual)", role="form")
+put(db, r, 2, "=TotalCost-Cost_MF", role="form", nf=NF_USD0, name="Cost_Retail"); r += 2
+
+# ---- Min-of sizing: blended, MF leg, Retail leg ----
+def size_leg(prefix, value_ref, cost_ref, noi_ref, maxltv, maxltc, mindscr, mindy, dconst, loanname):
+    global r
+    put(db, r, 1, f"{prefix}: max loan — LTV", role="form")
+    put(db, r, 2, f'=IF(Use_LTV="On",{value_ref}*{maxltv},1E15)', role="form", nf=NF_USD0, name=prefix+"_LTV"); r += 1
+    put(db, r, 1, f"{prefix}: max loan — LTC", role="form")
+    put(db, r, 2, f'=IF(Use_LTC="On",{cost_ref}*{maxltc},1E15)', role="form", nf=NF_USD0, name=prefix+"_LTC"); r += 1
+    put(db, r, 1, f"{prefix}: max loan — DSCR", role="form")
+    put(db, r, 2, f'=IF(Use_DSCR="On",{noi_ref}/({mindscr}*{dconst}),1E15)', role="form", nf=NF_USD0, name=prefix+"_DSCRcap"); r += 1
+    put(db, r, 1, f"{prefix}: max loan — Debt Yield", role="form")
+    put(db, r, 2, f'=IF(Use_DY="On",{noi_ref}/{mindy},1E15)', role="form", nf=NF_USD0, name=prefix+"_DYcap"); r += 1
+    put(db, r, 1, f"{prefix}: loan (MIN of active)", role="sub")
+    put(db, r, 2, f"=MIN({prefix}_LTV,{prefix}_LTC,{prefix}_DSCRcap,{prefix}_DYcap)", role="form", nf=NF_USD0, bold=True, name=loanname); r += 1
+    put(db, r, 1, f"{prefix}: binding constraint", role="form")
+    put(db, r, 2, f'=IF({loanname}={prefix}_LTV,"LTV",IF({loanname}={prefix}_LTC,"LTC",IF({loanname}={prefix}_DSCRcap,"DSCR","Debt Yield")))',
+        role="form", name=prefix+"_Binding"); r += 1
+    r += 1
+
+subhead(db, r, "Loan sizing (min-of constraints; binding flag)", 1, 6); r += 1
+size_leg("Blend", "PurchasePrice", "TotalCost", "GoingInNOI", "MaxLTV", "MaxLTC", "MinDSCR", "MinDebtYield", "DebtConstant", "BlendedLoan")
+size_leg("MFLn", "Value_MF", "Cost_MF", "GoingInNOI_MF", "MFLoan_MaxLTV", "MFLoan_MaxLTC", "MFLoan_MinDSCR", "MFLoan_MinDY", "MFLoan_DebtConstant", "MF_Loan")
+size_leg("RTLn", "Value_Retail", "Cost_Retail", "GoingInNOI_Retail", "RTLoan_MaxLTV", "RTLoan_MaxLTC", "RTLoan_MinDSCR", "RTLoan_MinDY", "RTLoan_DebtConstant", "RT_Loan")
+
+# ---- Active Loan A / Loan B (B=0 in single mode) ----
+SEP = 'DebtStructure="Separate MF + Retail Loans"'
+subhead(db, r, "Active loans (A + B); structure-driven", 1, 6); r += 1
+put(db, r, 1, "Loan A amount ($)", role="form")
+put(db, r, 2, f'=IF({SEP},MF_Loan,BlendedLoan)', role="form", nf=NF_USD0, name="LoanA_Amount"); r += 1
+put(db, r, 1, "Loan B amount ($)", role="form")
+put(db, r, 2, f'=IF({SEP},RT_Loan,0)', role="form", nf=NF_USD0, name="LoanB_Amount"); r += 1
+put(db, r, 1, "Loan A rate (%)", role="form")
+put(db, r, 2, f'=IF({SEP},MFLoan_Rate,LoanRate)', role="form", nf=NF_PCT2, name="LoanA_Rate"); r += 1
+put(db, r, 1, "Loan B rate (%)", role="form")
+put(db, r, 2, f'=IF({SEP},RTLoan_Rate,LoanRate)', role="form", nf=NF_PCT2, name="LoanB_Rate"); r += 1
+put(db, r, 1, "Loan A IO (months)", role="form")
+put(db, r, 2, f'=IF({SEP},MFLoan_IO,IOMonths)', role="form", nf=NF_MO, name="LoanA_IO"); r += 1
+put(db, r, 1, "Loan B IO (months)", role="form")
+put(db, r, 2, f'=IF({SEP},RTLoan_IO,IOMonths)', role="form", nf=NF_MO, name="LoanB_IO"); r += 1
+put(db, r, 1, "Loan A amort (years)", role="form")
+put(db, r, 2, f'=IF({SEP},MFLoan_Amort,AmortYears)', role="form", nf=NF_NUM, name="LoanA_Amort"); r += 1
+put(db, r, 1, "Loan B amort (years)", role="form")
+put(db, r, 2, f'=IF({SEP},RTLoan_Amort,AmortYears)', role="form", nf=NF_NUM, name="LoanB_Amort"); r += 1
+put(db, r, 1, "Property loan (A+B) ($)", role="form")
+put(db, r, 2, "=LoanA_Amount+LoanB_Amount", role="form", nf=NF_USD0, name="PropertyLoan"); r += 1
+put(db, r, 1, "Committed loan incl. financed holdback ($)", role="sub")
+put(db, r, 2, "=PropertyLoan+FinancedCapBudget", role="form", nf=NF_USD0, bold=True, name="LoanAmount"); r += 1
+put(db, r, 1, "Binding constraint", role="form")
+put(db, r, 2, f'=IF({SEP},"MF:"&MFLn_Binding&" / RT:"&RTLn_Binding,Blend_Binding)', role="form", bold=True, name="BindingConstraint"); r += 1
+put(db, r, 1, "Financing costs ($)", role="form")
+put(db, r, 2, f'=IF({SEP},MF_Loan*MFLoan_FinPct+RT_Loan*RTLoan_FinPct,BlendedLoan*FinanceCostPct)+FinancedCapBudget*FinanceCostPct',
+    role="form", nf=NF_USD0, name="FinancingCosts"); r += 2
+
+# ---- Refi (replaces both legs with a single new loan into Loan A) ----
+subhead(db, r, "Refi (toggle #5) — refinances total balance into Loan A", 1, 4); r += 1
+put(db, r, 1, "Refi month", role="form"); put(db, r, 2, D["refi_month"], role="input", nf=NF_MO, fill=FILL_INPUT, name="RefiMonth"); r += 1
+put(db, r, 1, "Refi cap on stabilized value (%)", role="form"); put(db, r, 2, D["refi_cap"], role="input", nf=NF_PCT2, fill=FILL_INPUT, name="RefiCap"); r += 1
+put(db, r, 1, "Refi LTV (%)", role="form"); put(db, r, 2, D["refi_ltv"], role="input", nf=NF_PCT, fill=FILL_INPUT, name="RefiLTV"); r += 1
+put(db, r, 1, "Refi cost (% of new loan)", role="form"); put(db, r, 2, D["refi_cost_pct"], role="input", nf=NF_PCT, fill=FILL_INPUT, name="RefiCostPct"); r += 1
 put(db, r, 1, "Stabilized value (for refi)", role="form")
 put(db, r, 2, "=StabNOI/RefiCap", role="form", nf=NF_USD0, name="StabValue"); r += 1
 put(db, r, 1, "New refi loan", role="form")
 put(db, r, 2, '=IF(RefiOn="On",MIN(StabValue*RefiLTV,StabNOI/(MinDSCR*DebtConstant)),0)', role="form", nf=NF_USD0, name="RefiLoan"); r += 1
 
-# Monthly debt schedule
+# ---- Monthly schedule: Loan A + Loan B ----
 mrow = r + 2
-subhead(db, mrow, "MONTHLY DEBT SCHEDULE", 1, 14); mrow += 1
+subhead(db, mrow, "MONTHLY DEBT SCHEDULE (Loan A + Loan B; B inert in Single mode)", 1, 14); mrow += 1
 put(db, mrow, 1, "Month index", role="sub")
 for i in range(MAX_MONTHS):
     put(db, mrow, M0 + i, f"={q(ASM)}!{mcol(i)}${PERIOD_IDX_ROW}", role="link", nf=NF_NUM)
 mrow += 1
-# Opening balance
-put(db, mrow, 1, "Loan balance — opening ($)", role="form")
-DB_BAL_OPEN = mrow
-# Closing balance
-DB_BAL_CLOSE = mrow + 1
-DB_INT = mrow + 2
-DB_PRIN = mrow + 3
-DB_DS = mrow + 4
-DB_DRAW = mrow + 5
-DB_EVENT = mrow + 6
-for i in range(MAX_MONTHS):
-    col = mcol(i); idx = f"{col}${mrow-1}"  # month index row above? actually period idx row local
-# Recompute with explicit references
+
+def leg_schedule(tag, amt, rate, io, amort, primary):
+    global mrow
+    base = mrow
+    rOpen, rDraw, rInt, rPrin, rDS, rEvent, rClose = (base, base+1, base+2, base+3, base+4, base+5, base+6)
+    put(db, rOpen, 1, f"Loan {tag}: opening balance ($)", role="form")
+    put(db, rDraw, 1, f"Loan {tag}: draw ($)", role="form")
+    put(db, rInt, 1, f"Loan {tag}: interest ($)", role="form")
+    put(db, rPrin, 1, f"Loan {tag}: principal ($)", role="form")
+    put(db, rDS, 1, f"Loan {tag}: debt service ($)", role="form")
+    put(db, rEvent, 1, f"Loan {tag}: refi payoff ($)", role="form")
+    put(db, rClose, 1, f"Loan {tag}: closing balance ($)", role="form")
+    for i in range(MAX_MONTHS):
+        col = mcol(i); prev = mcol(i-1) if i > 0 else None
+        idxref = f"{q(ASM)}!{col}${PERIOD_IDX_ROW}"; act = f"{q(ASM)}!{col}${OP_ACTIVE_ROW}"
+        if i == 0:
+            put(db, rOpen, M0 + i, "=0", role="form", nf=NF_USD0)
+            put(db, rDraw, M0 + i, f"={amt}", role="form", nf=NF_USD0)
+        else:
+            put(db, rOpen, M0 + i, f"={prev}${rClose}", role="form", nf=NF_USD0)
+            extra = f"+{q('CapEx')}!{col}${CX_FINDRAW_ROW}" if primary else ""
+            refi_new = f'+IF(AND(RefiOn="On",{idxref}=RefiMonth),RefiLoan,0)' if primary else ""
+            put(db, rDraw, M0 + i, f"=0{extra}{refi_new}", role="form", nf=NF_USD0)
+        put(db, rInt, M0 + i, f"={col}${rOpen}*{rate}/12*{act}", role="form", nf=NF_USD0)
+        pmt = f"PMT({rate}/12,{amort}*12-{io},-{col}${rOpen})"
+        put(db, rPrin, M0 + i,
+            f"=IF(AND({act}=1,{idxref}>{io},{col}${rOpen}>0),MIN({col}${rOpen},{pmt}-{col}${rInt}),0)",
+            role="form", nf=NF_USD0)
+        put(db, rDS, M0 + i, f"={col}${rInt}+{col}${rPrin}", role="form", nf=NF_USD0)
+        put(db, rEvent, M0 + i, f'=IF(AND(RefiOn="On",{idxref}=RefiMonth),-{col}${rOpen},0)', role="form", nf=NF_USD0)
+        put(db, rClose, M0 + i,
+            f"={col}${rOpen}+{col}${rDraw}-{col}${rPrin}+{col}${rEvent}", role="form", nf=NF_USD0)
+    mrow = rClose + 2
+    return dict(open=rOpen, draw=rDraw, intr=rInt, prin=rPrin, ds=rDS, event=rEvent, close=rClose)
+
+A = leg_schedule("A", "LoanA_Amount", "LoanA_Rate", "LoanA_IO", "LoanA_Amort", True)
+B = leg_schedule("B", "LoanB_Amount", "LoanB_Rate", "LoanB_IO", "LoanB_Amort", False)
+
+# ---- Totals (A + B) — these feed the Monthly CF ----
+DB_BAL_OPEN = mrow; DB_BAL_CLOSE = mrow+1; DB_DS = mrow+2; DB_DRAW = mrow+3; DB_EVENT = mrow+4
+put(db, DB_BAL_OPEN, 1, "TOTAL opening balance ($)", role="sub")
+put(db, DB_BAL_CLOSE, 1, "TOTAL closing balance ($)", role="sub")
+put(db, DB_DS, 1, "TOTAL debt service ($)", role="sub")
+put(db, DB_DRAW, 1, "TOTAL loan draws ($)", role="sub")
+put(db, DB_EVENT, 1, "TOTAL refi payoff ($)", role="sub")
 for i in range(MAX_MONTHS):
     col = mcol(i)
-    prev = mcol(i-1) if i>0 else None
-    idxref = f"{q(ASM)}!{col}${PERIOD_IDX_ROW}"
-    act = f"{q(ASM)}!{col}${OP_ACTIVE_ROW}"
-    # opening balance
-    if i == 0:
-        put(db, DB_BAL_OPEN, M0 + i, "=0", role="form", nf=NF_USD0)
-    else:
-        put(db, DB_BAL_OPEN, M0 + i, f"={prev}${DB_BAL_CLOSE}", role="form", nf=NF_USD0)
-    # draw at month 0 (initial loan, aligns with acquisition) and refi handling thereafter
-    if i == 0:
-        draw = "=LoanAmount"
-    else:
-        draw = f'=IF(AND(RefiOn="On",{idxref}=RefiMonth),RefiLoan,0)'
-    put(db, DB_DRAW, M0 + i, draw, role="form", nf=NF_USD0)
-    # payoff old at refi (event = negative principal reduction handled in close)
-    # interest on opening balance
-    put(db, DB_INT, M0 + i, f"={col}${DB_BAL_OPEN}*LoanRate/12*{act}", role="form", nf=NF_USD0)
-    # principal: amortize after IO, only when loan active and not refi-payoff month
-    io_done = f"{idxref}>IOMonths"
-    pmt = (f"PMT(LoanRate/12,AmortYears*12-(IOMonths),-{col}${DB_BAL_OPEN})")
-    put(db, DB_PRIN, M0 + i,
-        f"=IF(AND({act}=1,{io_done},{col}${DB_BAL_OPEN}>0),MIN({col}${DB_BAL_OPEN},{pmt}-{col}${DB_INT}),0)",
-        role="form", nf=NF_USD0)
-    # debt service
-    put(db, DB_DS, M0 + i, f"={col}${DB_INT}+{col}${DB_PRIN}", role="form", nf=NF_USD0)
-    # refi payoff event (pay off opening balance at refi month)
-    put(db, DB_EVENT, M0 + i,
-        f'=IF(AND(RefiOn="On",{idxref}=RefiMonth),-{col}${DB_BAL_OPEN},0)', role="form", nf=NF_USD0)
-    # closing balance = opening + draw - principal + refi payoff
-    put(db, DB_BAL_CLOSE, M0 + i,
-        f"={col}${DB_BAL_OPEN}+{col}${DB_DRAW}-{col}${DB_PRIN}+{col}${DB_EVENT}", role="form", nf=NF_USD0)
-put(db, DB_BAL_OPEN, 1, "Loan balance — opening ($)", role="form")
-put(db, DB_BAL_CLOSE, 1, "Loan balance — closing ($)", role="form")
-put(db, DB_INT, 1, "Interest ($/mo)", role="form")
-put(db, DB_PRIN, 1, "Principal ($/mo)", role="form")
-put(db, DB_DS, 1, "Debt service ($/mo)", role="form")
-put(db, DB_DRAW, 1, "Loan draw ($)", role="form")
-put(db, DB_EVENT, 1, "Refi payoff / event ($)", role="form")
+    put(db, DB_BAL_OPEN, M0+i, f"={col}${A['open']}+{col}${B['open']}", role="form", nf=NF_USD0, bold=True)
+    put(db, DB_BAL_CLOSE, M0+i, f"={col}${A['close']}+{col}${B['close']}", role="form", nf=NF_USD0, bold=True)
+    put(db, DB_DS, M0+i, f"={col}${A['ds']}+{col}${B['ds']}", role="form", nf=NF_USD0, bold=True)
+    put(db, DB_DRAW, M0+i, f"={col}${A['draw']}+{col}${B['draw']}", role="form", nf=NF_USD0, bold=True)
+    put(db, DB_EVENT, M0+i,
+        f'={col}${A["event"]}+{col}${B["event"]}-IF(AND(RefiOn="On",{q(ASM)}!{col}${PERIOD_IDX_ROW}=RefiMonth),RefiLoan*RefiCostPct,0)',
+        role="form", nf=NF_USD0, bold=True)
 add_name("DB_DS_Row", db.title, f"${mcol(0)}${DB_DS}")
 add_name("DB_Draw_Row", db.title, f"${mcol(0)}${DB_DRAW}")
 add_name("DB_BalClose_Row", db.title, f"${mcol(0)}${DB_BAL_CLOSE}")
 add_name("DB_Event_Row", db.title, f"${mcol(0)}${DB_EVENT}")
 
-# Refi cash-out (distribution event) = new loan - old payoff - refi cost, at refi month
-mrow2 = DB_EVENT + 2
-put(db, mrow2, 1, "Refi cash-out (to waterfall) ($)", role="form")
-DB_CASHOUT = mrow2
+# ---- Refi cash-out (new loan - total payoff - cost) to the waterfall ----
+DB_CASHOUT = DB_EVENT + 2
+put(db, DB_CASHOUT, 1, "Refi cash-out (to waterfall) ($)", role="form")
 for i in range(MAX_MONTHS):
     col = mcol(i); idxref = f"{q(ASM)}!{col}${PERIOD_IDX_ROW}"
-    put(db, mrow2, M0 + i,
+    put(db, DB_CASHOUT, M0 + i,
         f'=IF(AND(RefiOn="On",{idxref}=RefiMonth),RefiLoan-{col}${DB_BAL_OPEN}-RefiLoan*RefiCostPct,0)',
         role="form", nf=NF_USD0)
 add_name("DB_CashOut_Row", db.title, f"${mcol(0)}${DB_CASHOUT}")
@@ -1137,6 +1241,13 @@ MC_EGI = cf_line("Total EGI", "form", lambda col,i: f"={col}${MC_MFEGI}+{col}${M
 MC_OPEX = cf_line("OpEx (excl. taxes)", "link", lambda col,i: f"={q('OpEx')}!{col}${OX_TOT_ROW}")
 MC_TAX = cf_line("Taxes", "link", lambda col,i: f"={q('Taxes')}!{col}${TX_MONTHLY_ROW}")
 MC_NOI = cf_line("NOI", "form", lambda col,i: f"={col}${MC_EGI}+{col}${MC_OPEX}+{col}${MC_TAX}", bold=True)
+# Component NOI: OpEx + taxes allocated by EGI share, so MF NOI + Retail NOI == total NOI.
+MC_MFNOI = cf_line("  MF NOI (allocated)", "form",
+    lambda col,i: f"={col}${MC_MFEGI}+({col}${MC_OPEX}+{col}${MC_TAX})*IFERROR({col}${MC_MFEGI}/({col}${MC_MFEGI}+{col}${MC_RTEGI}),0)")
+MC_RTNOI = cf_line("  Retail NOI (allocated)", "form",
+    lambda col,i: f"={col}${MC_RTEGI}+({col}${MC_OPEX}+{col}${MC_TAX})*IFERROR({col}${MC_RTEGI}/({col}${MC_MFEGI}+{col}${MC_RTEGI}),0)")
+add_name("MC_MFNOI_Row", mc.title, f"${mcol(0)}${MC_MFNOI}")
+add_name("MC_RTNOI_Row", mc.title, f"${mcol(0)}${MC_RTNOI}")
 MC_RESV = cf_line("Replacement reserves", "link", lambda col,i: f"={q('OpEx')}!{col}${OX_RESV_ROW}")
 MC_CAP = cf_line("CapEx / TI/LC", "link", lambda col,i: f"={q('CapEx')}!{col}${CX_TOT_ROW}")
 MC_UCF = cf_line("Unlevered cash flow (ops)", "form",
@@ -1211,14 +1322,16 @@ add_name("MC_UCF_Row", mc.title, f"${mcol(0)}${MC_UTOT}")
 add_name("MC_NOI_Row", mc.title, f"${mcol(0)}${MC_NOI}")
 add_name("MC_Date_Row", mc.title, f"${mcol(0)}${MC_DATE_ROW}")
 
-# Now wire Debt StabNOI / GoingInNOI to CF NOI (sum windows)
-# Going-in = sum NOI months 1..12 ; Stabilized = sum NOI months 13..24 (post-ramp proxy)
-goingin_formula = f"=SUM({mcol(1)}${MC_NOI}:{mcol(12)}${MC_NOI})"
-stab_formula = f"=SUM({mcol(13)}${MC_NOI}:{mcol(24)}${MC_NOI})"
-put(db, DB_GOINGIN_NOI, 2, f"={q('Monthly CF')}!{mcol(1)}${MC_NOI}*0+"+f"SUM({q('Monthly CF')}!{mcol(1)}${MC_NOI}:{q('Monthly CF')}!{mcol(12)}${MC_NOI})",
-    role="link", nf=NF_USD0)
-put(db, DB_STAB_NOI, 2, f"=SUM({q('Monthly CF')}!{mcol(13)}${MC_NOI}:{q('Monthly CF')}!{mcol(24)}${MC_NOI})",
-    role="link", nf=NF_USD0)
+# Now wire Debt NOI cells to CF NOI windows (total + MF/Retail components).
+# Going-in = sum NOI months 1..12 ; Stabilized = sum NOI months 13..24 (post-ramp proxy).
+def noi_window(rownum, a, b):
+    return f"=SUM({q('Monthly CF')}!{mcol(a)}${rownum}:{mcol(b)}${rownum})"
+put(db, DB_GOINGIN_NOI, 2, noi_window(MC_NOI, 1, 12), role="link", nf=NF_USD0)
+put(db, DB_STAB_NOI, 2, noi_window(MC_NOI, 13, 24), role="link", nf=NF_USD0)
+put(db, DB_GOINGIN_MF, 2, noi_window(MC_MFNOI, 1, 12), role="link", nf=NF_USD0)
+put(db, DB_STAB_MF, 2, noi_window(MC_MFNOI, 13, 24), role="link", nf=NF_USD0)
+put(db, DB_GOINGIN_RT, 2, noi_window(MC_RTNOI, 1, 12), role="link", nf=NF_USD0)
+put(db, DB_STAB_RT, 2, noi_window(MC_RTNOI, 13, 24), role="link", nf=NF_USD0)
 
 # ---- Annual roll-up ----
 ar = mrow + 2
@@ -1346,46 +1459,132 @@ put(wf, r, 2, '=IF(AMFeeBasis="% of Cost",TotalCost,IF(AMFeeBasis="% of NOI",Sta
 put(wf, r, 1, "AM fee ($/yr)", role="form")
 put(wf, r, 2, '=IF(AMFeeOn="On",AMFeeBaseAmt*AMFeeRate,0)', role="form", nf=NF_USD0, name="AMFeeAnnual"); r += 2
 
-# Waterfall summary results (simplified IRR-tier promote on aggregate levered CF)
-subhead(wf, r, "Distribution results (LP / GP)", 1, 6); r += 1
+# =====================================================================================
+# STEP-BY-STEP AMERICAN WATERFALL (monthly, period-by-period, gated by LP Present)
+# Tier order each period:  (1) Return of Capital  (2) Preferred return (compounded)
+#   (3) GP Catch-up (toggle)  (4) Residual split by IRR hurdle (CarryTiers table).
+# Investor = LP + GP co-invest (pooled for ROC/pref); promote accrues to GP.
+# By construction every period: LP dist + GP dist = cash distributed, and
+# SUM(LP cash flow) + SUM(GP cash flow) = project levered CF (conserves).
+# =====================================================================================
+subhead(wf, r, "Headline (project level)", 1, 6); r += 1
 put(wf, r, 1, "Total levered CF to equity ($)", role="form")
-put(wf, r, 2, f"=SUM({q('Monthly CF')}!{mcol(0)}${MC_LCF}:{q('Monthly CF')}!{mcol(MAX_MONTHS-1)}${MC_LCF})"
-              f"+SUM({q('Debt')}!{mcol(0)}${DB_CASHOUT}:{q('Debt')}!{mcol(MAX_MONTHS-1)}${DB_CASHOUT})",
+put(wf, r, 2, f"=SUM({q('Monthly CF')}!{mcol(0)}${MC_LCF}:{mcol(MAX_MONTHS-1)}${MC_LCF})",
     role="link", nf=NF_USD0, name="TotalLeveredCF"); r += 1
-WF_PROFIT = r
-put(wf, r, 1, "Total profit (CF + initial equity) ($)", role="form")
-put(wf, r, 2, "=TotalLeveredCF", role="form", nf=NF_USD0); r += 1
 put(wf, r, 1, "Project levered IRR (%)", role="form")
-put(wf, r, 2, f"=XIRR({q('Monthly CF')}!{mcol(0)}${MC_LCF}:{q('Monthly CF')}!{mcol(MAX_MONTHS-1)}${MC_LCF},"
-              f"{q('Monthly CF')}!{mcol(0)}${MC_DATE_ROW}:{q('Monthly CF')}!{mcol(MAX_MONTHS-1)}${MC_DATE_ROW})",
+put(wf, r, 2, f"=XIRR({q('Monthly CF')}!{mcol(0)}${MC_LCF}:{mcol(MAX_MONTHS-1)}${MC_LCF},"
+              f"{q('Monthly CF')}!{mcol(0)}${MC_DATE_ROW}:{mcol(MAX_MONTHS-1)}${MC_DATE_ROW})",
     role="link", nf=NF_PCT2, name="LeveredIRR"); r += 1
-put(wf, r, 1, "Equity multiple (x)", role="form")
-put(wf, r, 2, f"=SUMIF({q('Monthly CF')}!{mcol(0)}${MC_LCF}:{q('Monthly CF')}!{mcol(MAX_MONTHS-1)}${MC_LCF},\">0\")/"
-              f"MAX(1,-SUMIF({q('Monthly CF')}!{mcol(0)}${MC_LCF}:{q('Monthly CF')}!{mcol(MAX_MONTHS-1)}${MC_LCF},\"<0\"))",
-    role="link", nf=NF_MULT, name="EquityMultiple"); r += 1
+put(wf, r, 1, "Project equity multiple (x)", role="form")
+put(wf, r, 2, f"=SUMIF({q('Monthly CF')}!{mcol(0)}${MC_LCF}:{mcol(MAX_MONTHS-1)}${MC_LCF},\">0\")/"
+              f"MAX(1,-SUMIF({q('Monthly CF')}!{mcol(0)}${MC_LCF}:{mcol(MAX_MONTHS-1)}${MC_LCF},\"<0\"))",
+    role="link", nf=NF_MULT, name="EquityMultiple"); r += 2
 
-# Simplified promote: GP carry on profit using blended carry from tier table by IRR
-put(wf, r, 1, "GP carry % (by IRR tier)", role="form")
-# IFERROR falls back to the lowest tier's GP% when IRR is below the first hurdle.
-put(wf, r, 2, '=IF(LP_Present="No",0,IFERROR(INDEX(CarryTiers,MATCH(LeveredIRR,INDEX(CarryTiers,0,1),1)+1,3),INDEX(CarryTiers,1,3)))',
-    role="form", nf=NF_PCT, name="GPCarryPct"); r += 1
-put(wf, r, 1, "Distributable profit (>0) ($)", role="form")
-put(wf, r, 2, "=MAX(0,TotalLeveredCF)", role="form", nf=NF_USD0, name="DistributableProfit"); r += 1
-# Promote is a reallocation FROM LP TO GP on the LP's profit share, scaled by the
-# catch-up toggle. By construction LPDist+GPDist == TotalLeveredCF (conserves cash).
-put(wf, r, 1, "GP promote ($) [carry on LP profit share]", role="form")
-put(wf, r, 2, '=IF(LP_Present="No",0,DistributableProfit*LP_Split*GPCarryPct*(1+IF(GPCatchUpOn="On",CatchUpPct,0)))',
-    role="form", nf=NF_USD0, name="GPPromote"); r += 1
-put(wf, r, 1, "LP distribution ($)", role="form")
-put(wf, r, 2, '=IF(LP_Present="No",0,TotalLeveredCF*LP_Split-GPPromote)',
-    role="form", nf=NF_USD0, name="LPDist"); r += 1
-put(wf, r, 1, "GP distribution ($)", role="form")
-put(wf, r, 2, '=IF(LP_Present="No",TotalLeveredCF,TotalLeveredCF*GP_Split+GPPromote)',
-    role="form", nf=NF_USD0, name="GPDist"); r += 1
+# ---- shorthand fragments ----
+PREFM = "((1+PrefRate)^(1/12)-1)"
+H12M = "((1+INDEX(CarryTiers,2,1))^(1/12)-1)"
+H15M = "((1+INDEX(CarryTiers,3,1))^(1/12)-1)"
+LPA, GPA = "INDEX(CarryTiers,2,2)", "INDEX(CarryTiers,2,3)"
+LPB, GPB = "INDEX(CarryTiers,3,2)", "INDEX(CarryTiers,3,3)"
+LPC, GPC = "INDEX(CarryTiers,4,2)", "INDEX(CarryTiers,4,3)"
+LPFRAC = "(LP_Split+GP_Split*(1-GP_CoInvest))"
+GPCOFRAC = "(GP_Split*GP_CoInvest)"
+
+subhead(wf, r, "Monthly waterfall (cols E.. align to period header)", 1, 14); r += 1
+mrow = r
+put(wf, mrow, 1, "Month index", role="sub")
+for i in range(MAX_MONTHS):
+    put(wf, mrow, M0+i, f"={q(ASM)}!{mcol(i)}${PERIOD_IDX_ROW}", role="link", nf=NF_NUM)
+mrow += 1
+
+def wf_row(label, builder, nf=NF_USD0, bold=False, name=None, link=False):
+    global mrow
+    put(wf, mrow, 1, label, role="sub" if bold else "form")
+    rn = mrow
+    role = "link" if link else "form"
+    for i in range(MAX_MONTHS):
+        col = mcol(i); pcol = (mcol(i-1) if i > 0 else None)
+        put(wf, mrow, M0+i, builder(col, pcol, i), role=role, nf=nf, bold=bold)
+    if name:
+        add_name(name, wf.title, f"${mcol(0)}${rn}")
+    mrow += 1
+    return rn
+
+def pv(row, pcol, i):  # previous-period balance, 0 at month 0
+    return "0" if i == 0 else f"{pcol}${row}"
+
+# Predeclare row numbers (running balances are referenced before their rows are written).
+(W_LCF, W_CON, W_DIST, W_PACR, W_ROC, W_PREF, W_CATCH, W_CGP, W_CINV,
+ W_ACC12, W_ACC15, W_TA, W_TB, W_TC, W_INVD, W_GPPR, W_UNRET, W_PREFB,
+ W_INVC, W_CUMP, W_CUMC, W_LP, W_GPCO, W_GPT, W_LPCF, W_GPCF) = range(mrow, mrow + 26)
+
+W_LCF   = wf_row("Levered CF (project)", lambda c,p,i: f"={q('Monthly CF')}!{c}${MC_LCF}", link=True)
+W_CON   = wf_row("Capital contributions", lambda c,p,i: f"=MAX(0,-{c}${W_LCF})")
+W_DIST  = wf_row("Cash available to distribute", lambda c,p,i: f"=MAX(0,{c}${W_LCF})")
+W_PACR  = wf_row("Pref accrued this period", lambda c,p,i: f"=({pv(W_UNRET,p,i)}+{pv(W_PREFB,p,i)})*{PREFM}")
+W_ROC   = wf_row("Tier 1 — Return of Capital", lambda c,p,i: f"=MIN({c}${W_DIST},{pv(W_UNRET,p,i)}+{c}${W_CON})")
+W_PREF  = wf_row("Tier 2 — Preferred return", lambda c,p,i: f"=MIN({c}${W_DIST}-{c}${W_ROC},{pv(W_PREFB,p,i)}+{c}${W_PACR})")
+# Tier 3 — GP catch-up (toggle). Target: GP holds GPA/LPA of pref after full catch-up.
+W_CATCH = wf_row("Tier 3 — Catch-up (total)",
+    lambda c,p,i: (f'=IF(GPCatchUpOn="On",MIN({c}${W_DIST}-{c}${W_ROC}-{c}${W_PREF},'
+                   f'MAX(0,({GPA}/{LPA})*({pv(W_CUMP,p,i)}+{c}${W_PREF})-{pv(W_CUMC,p,i)})/MAX(CatchUpPct,0.000001)),0)'))
+W_CGP   = wf_row("  Catch-up to GP", lambda c,p,i: f"={c}${W_CATCH}*CatchUpPct")
+W_CINV  = wf_row("  Catch-up to investors", lambda c,p,i: f"={c}${W_CATCH}*(1-CatchUpPct)")
+W_ACC12 = wf_row("Investor balance @ tier-2 hurdle", lambda c,p,i: f"={pv(W_ACC12,p,i)}*(1+{H12M})+{c}${W_CON}")
+W_ACC15 = wf_row("Investor balance @ tier-3 hurdle", lambda c,p,i: f"={pv(W_ACC15,p,i)}*(1+{H15M})+{c}${W_CON}")
+# Residual tiers (rem after ROC+pref+catch-up). invsofar = prev invcum + this-period investor receipts.
+def REM3(c): return f"({c}${W_DIST}-{c}${W_ROC}-{c}${W_PREF}-{c}${W_CATCH})"
+def INVSF0(c, p, i): return f"({pv(W_INVC,p,i)}+{c}${W_ROC}+{c}${W_PREF}+{c}${W_CINV})"
+W_TA = wf_row("Tier 4a — residual to hurdle 2",
+    lambda c,p,i: f"=MIN({REM3(c)},MAX(0,{c}${W_ACC12}-{INVSF0(c,p,i)})/{LPA})")
+W_TB = wf_row("Tier 4b — residual to hurdle 3",
+    lambda c,p,i: f"=MIN({REM3(c)}-{c}${W_TA},MAX(0,{c}${W_ACC15}-({INVSF0(c,p,i)}+{LPA}*{c}${W_TA}))/{LPB})")
+W_TC = wf_row("Tier 4c — residual above hurdle 3",
+    lambda c,p,i: f"={REM3(c)}-{c}${W_TA}-{c}${W_TB}")
+W_INVD = wf_row("Investor distribution (total)",
+    lambda c,p,i: f"={c}${W_ROC}+{c}${W_PREF}+{c}${W_CINV}+{LPA}*{c}${W_TA}+{LPB}*{c}${W_TB}+{LPC}*{c}${W_TC}")
+W_GPPR = wf_row("GP promote (catch-up + carry)",
+    lambda c,p,i: f"={c}${W_CGP}+{GPA}*{c}${W_TA}+{GPB}*{c}${W_TB}+{GPC}*{c}${W_TC}", name="GPPromoteRow")
+# running balances (end of period)
+W_UNRET = wf_row("Unreturned capital (end)", lambda c,p,i: f"={pv(W_UNRET,p,i)}+{c}${W_CON}-{c}${W_ROC}")
+W_PREFB = wf_row("Pref balance (end)", lambda c,p,i: f"={pv(W_PREFB,p,i)}+{c}${W_PACR}-{c}${W_PREF}")
+W_INVC  = wf_row("Investor cumulative dist (end)", lambda c,p,i: f"={pv(W_INVC,p,i)}+{c}${W_INVD}")
+W_CUMP  = wf_row("Cumulative pref paid (end)", lambda c,p,i: f"={pv(W_CUMP,p,i)}+{c}${W_PREF}")
+W_CUMC  = wf_row("Cumulative catch-up to GP (end)", lambda c,p,i: f"={pv(W_CUMC,p,i)}+{c}${W_CGP}")
+# LP / GP split (gated by LP Present)
+W_LP   = wf_row("LP distribution", lambda c,p,i: f'=IF(LP_Present="No",0,{c}${W_INVD}*{LPFRAC})', bold=True)
+W_GPCO = wf_row("GP co-invest distribution", lambda c,p,i: f'=IF(LP_Present="No",0,{c}${W_INVD}*{GPCOFRAC})')
+W_GPT  = wf_row("GP distribution (co-invest + promote)",
+    lambda c,p,i: f'=IF(LP_Present="No",{c}${W_DIST},{c}${W_GPCO}+{c}${W_GPPR})', bold=True)
+W_LPCF = wf_row("LP cash flow (contrib + dist)",
+    lambda c,p,i: f'=IF(LP_Present="No",0,-{c}${W_CON}*{LPFRAC}+{c}${W_LP})')
+W_GPCF = wf_row("GP cash flow (contrib + dist)",
+    lambda c,p,i: f'=IF(LP_Present="No",{c}${W_LCF},-{c}${W_CON}*{GPCOFRAC}+{c}${W_GPT})')
+
+# ---- Aggregate distribution results / partner returns ----
+r = mrow + 1
+subhead(wf, r, "Distribution results & partner returns", 1, 6); r += 1
+def wsum(row): return f"=SUM({mcol(0)}${row}:{mcol(MAX_MONTHS-1)}${row})"
+put(wf, r, 1, "LP distributions ($)", role="form"); put(wf, r, 2, wsum(W_LP), role="form", nf=NF_USD0, name="LPDist"); r += 1
+put(wf, r, 1, "GP distributions ($)", role="form"); put(wf, r, 2, wsum(W_GPT), role="form", nf=NF_USD0, name="GPDist"); r += 1
+put(wf, r, 1, "GP promote ($)", role="form"); put(wf, r, 2, wsum(W_GPPR), role="form", nf=NF_USD0, name="GPPromote"); r += 1
+put(wf, r, 1, "LP IRR (%)", role="form")
+put(wf, r, 2, f"=IFERROR(XIRR({mcol(0)}${W_LPCF}:{mcol(MAX_MONTHS-1)}${W_LPCF},"
+              f"{q('Monthly CF')}!{mcol(0)}${MC_DATE_ROW}:{mcol(MAX_MONTHS-1)}${MC_DATE_ROW}),0)",
+    role="form", nf=NF_PCT2, name="LP_IRR"); r += 1
+put(wf, r, 1, "GP IRR (%)", role="form")
+put(wf, r, 2, f"=IFERROR(XIRR({mcol(0)}${W_GPCF}:{mcol(MAX_MONTHS-1)}${W_GPCF},"
+              f"{q('Monthly CF')}!{mcol(0)}${MC_DATE_ROW}:{mcol(MAX_MONTHS-1)}${MC_DATE_ROW}),0)",
+    role="form", nf=NF_PCT2, name="GP_IRR"); r += 1
+put(wf, r, 1, "LP equity multiple (x)", role="form")
+put(wf, r, 2, f"=SUMIF({mcol(0)}${W_LPCF}:{mcol(MAX_MONTHS-1)}${W_LPCF},\">0\")/"
+              f"MAX(1,-SUMIF({mcol(0)}${W_LPCF}:{mcol(MAX_MONTHS-1)}${W_LPCF},\"<0\"))",
+    role="form", nf=NF_MULT, name="LP_EM"); r += 1
 put(wf, r, 1, "Sponsor / single-sponsor levered return (%)", role="form")
-put(wf, r, 2, "=LeveredIRR", role="form", nf=NF_PCT2, name="SponsorIRR"); r += 1
-put(wf, r, 1, "Check: LP+GP = total levered CF", role="form")
-put(wf, r, 2, '=IF(LP_Present="No",GPDist,LPDist+GPDist)', role="form", nf=NF_USD0, name="WF_Check"); r += 1
+put(wf, r, 2, '=IF(LP_Present="No",LeveredIRR,GP_IRR)', role="form", nf=NF_PCT2, name="SponsorIRR"); r += 1
+put(wf, r, 1, "Check: SUM(LP CF)+SUM(GP CF) = project levered CF", role="form")
+put(wf, r, 2, f"=SUM({mcol(0)}${W_LPCF}:{mcol(MAX_MONTHS-1)}${W_LPCF})+SUM({mcol(0)}${W_GPCF}:{mcol(MAX_MONTHS-1)}${W_GPCF})",
+    role="form", nf=NF_USD0, name="WF_Check"); r += 1
 
 # ======================================================================================
 # TAB 2 — SUMMARY / RETURNS (built last, placed second)
@@ -1449,6 +1648,14 @@ kv("Development spread (bps)", "=DevSpread", nf=NF_BPS)
 kv("Loan amount ($)", "=LoanAmount")
 kv("Binding constraint", "=BindingConstraint", nf=None)
 kv("Initial equity ($)", "=InitialEquity")
+r += 1
+subhead(sm, r, "Partner returns (waterfall)", 1, 4); r += 1
+kv("LP IRR (%)", "=LP_IRR", nf=NF_PCT2)
+kv("GP IRR (%)", "=GP_IRR", nf=NF_PCT2)
+kv("LP equity multiple (x)", "=LP_EM", nf=NF_MULT)
+kv("GP promote ($)", "=GPPromote")
+kv("LP distributions ($)", "=LPDist")
+kv("GP distributions ($)", "=GPDist")
 r += 1
 subhead(sm, r, "Acceptance checks", 1, 4); r += 1
 kv("Sources = Uses?", "=ABS(SourcesTotal-UsesTotal)<1", nf=None, name="Chk_SU")
@@ -1521,7 +1728,8 @@ icrow(r, "Total cost", "=TotalCost", NF_USD0, "Binding constraint", "=BindingCon
 subhead(ic, r, "Returns", 1, 4); r += 1
 icrow(r, "Unlevered IRR", "=UnleveredIRR", NF_PCT2, "Levered IRR", "=LeveredIRR", NF_PCT2); r += 1
 icrow(r, "Equity multiple", "=EquityMultiple", NF_MULT, "Yield-on-cost", "=YieldOnCost", NF_PCT2); r += 1
-icrow(r, "Exit cap", "=ExitCapBlended", NF_PCT2, "Development spread (bps)", "=DevSpread", NF_BPS); r += 2
+icrow(r, "Exit cap", "=ExitCapBlended", NF_PCT2, "Development spread (bps)", "=DevSpread", NF_BPS); r += 1
+icrow(r, "LP IRR", "=LP_IRR", NF_PCT2, "GP IRR", "=GP_IRR", NF_PCT2); r += 2
 subhead(ic, r, "Debt terms", 1, 4); r += 1
 icrow(r, "Loan rate", "=LoanRate", NF_PCT2, "Amort (yrs)", "=AmortYears", NF_NUM); r += 1
 icrow(r, "IO (mo)", "=IOMonths", NF_MO, "Refi", "=RefiOn", None); r += 2

@@ -73,6 +73,7 @@ class Inputs:
     renewal_ti: float = D["renewal_ti"]
     lc_pct: float = D["lc_pct"]
     admin_fee_on: bool = True
+    gross_up_on: bool = True
     admin_fee_pct: float = D["admin_fee_pct"]
     recov_cam: float = D["recov_cam"]
     recov_tax: float = D["recov_tax"]
@@ -87,6 +88,7 @@ class Inputs:
     tax_flat_growth: float = D["tax_flat_growth"]
     base_annual_tax: float = D["base_annual_tax"]
     pilot_annual_tax: float = D["pilot_annual_tax"]
+    pilot_schedule: tuple = tuple(MI.PILOT_SCHEDULE)
     # CapEx buckets (amount, funding, start, months)
     cap_repairs: float = D["cap_repairs"]
     cap_tilc: float = D["cap_tilc"]
@@ -111,10 +113,16 @@ class Inputs:
     io_months: int = D["io_months"]
     amort_years: int = D["amort_years"]
     finance_cost_pct: float = D["finance_cost_pct"]
+    debt_structure: str = "Single Blended Loan"   # or "Separate MF + Retail Loans"
+    mf_loan_rate: float = D["mf_loan_rate"]
+    rt_loan_rate: float = D["rt_loan_rate"]
     refi_on: str = "Off"
     # Waterfall
     lp_present: str = "Yes"
     lp_split: float = D["lp_split"]
+    gp_coinvest: float = D["gp_coinvest"]
+    pref_rate: float = D["pref_rate"]
+    catchup_pct: float = D["catchup_pct"]
     gp_catchup_on: bool = True
     acq_fee_on: bool = True
     am_fee_on: bool = True
@@ -210,8 +218,11 @@ def engine(inp: Inputs, price: float):
                 gap = 1 if i > le + inp.retail_downtime else 0
                 base += gap*(br*sf/12*cf_rt*inp.renewal_rent_factor)
             cam, tax_b, ins, stop = RECOV_MATRIX.get(struct, (0,0,0,0))
-            pool = (cam*inp.recov_cam + tax_b*inp.recov_tax + ins*inp.recov_ins)*sf/12*cf_ox
-            recov += pool*(1 + (inp.admin_fee_pct if inp.admin_fee_on else 0))*a
+            base_pool = (cam*inp.recov_cam + tax_b*inp.recov_tax + ins*inp.recov_ins)*sf/12
+            grossup = 1/(1 - inp.retail_genvac) if inp.gross_up_on else 1.0
+            admin = 1 + (inp.admin_fee_pct if inp.admin_fee_on else 0)
+            escalation = max(0.0, cf_ox - 1) if stop == 1 else cf_ox   # MG: only growth above base year
+            recov += base_pool*grossup*admin*escalation*a
             if a and i == le + inp.retail_downtime:
                 tilc += (((1-inp.retail_renewal_prob)*inp.new_lease_ti + inp.retail_renewal_prob*inp.renewal_ti)*sf*cf_tilc
                          + inp.lc_pct*br*sf*cf_tilc)
@@ -231,7 +242,7 @@ def engine(inp: Inputs, price: float):
         if inp.tax_method == "Flat Growth":
             ann = inp.base_annual_tax*(1+inp.tax_flat_growth)**max(yr-1, 0)
         elif inp.tax_method == "PILOT / Abatement":
-            ann = inp.pilot_annual_tax
+            ann = inp.pilot_schedule[min(max(yr, 1), 11) - 1]
         else:
             ann = price*inp.assess_ratio*inp.mill_rate*(1+inp.tax_flat_growth)**max(yr-1, 0)
         txm = -ann/12*a
@@ -248,52 +259,85 @@ def engine(inp: Inputs, price: float):
         capex[i], rt_tilc[i] = cap, tilc
         noi[i] = mf + rt + ox + txm
 
-    # ---- Debt sizing (iterate for financing-cost circularity) ----
-    going_in = sum(noi[1:13])
-    stab = sum(noi[13:25])
-    rate = inp.fixed_rate if inp.loan_rate_type == "Fixed" else inp.sofr + inp.spread_bps/10000
-    rm = rate/12
-    n = inp.amort_years*12
-    debt_constant = (rm/(1-(1+rm)**(-n)))*12 if rm > 0 else 1
-    BIG = 1e15
-    loan_amt = 0.0
-    for _ in range(8):
-        fin_cost = loan_amt*inp.finance_cost_pct
-        total_cost = price + price*inp.closing_pct + total_cap + fin_cost
-        l_ltv = price*inp.max_ltv if inp.use_ltv else BIG
-        l_ltc = total_cost*inp.max_ltc if inp.use_ltc else BIG
-        l_dscr = going_in/(inp.min_dscr*debt_constant) if inp.use_dscr else BIG
-        l_dy = going_in/inp.min_dy if inp.use_dy else BIG
-        loan_base = min(l_ltv, l_ltc, l_dscr, l_dy)
-        loan_amt = loan_base + financed_cap
-    fin_cost = loan_amt*inp.finance_cost_pct
-    total_cost = price + price*inp.closing_pct + total_cap + fin_cost
-    constraints = {"LTV": l_ltv, "LTC": l_ltc, "DSCR": l_dscr, "Debt Yield": l_dy}
-    binding = min(constraints, key=constraints.get)
-
-    # ---- Debt schedule ----
-    bal = [0.0]*MAX_MONTHS; ds = [0.0]*MAX_MONTHS
-    open_bal = 0.0
+    # ---- Component NOI (OpEx + taxes allocated by EGI share -> MF + Retail = total) ----
+    mf_noi = [0.0]*MAX_MONTHS; rt_noi = [0.0]*MAX_MONTHS
     for i in range(MAX_MONTHS):
-        draw = loan_amt if i == 0 else 0.0
-        opening = open_bal
-        interest = opening*rm*active[i]
-        if active[i] and i > inp.io_months and opening > 0:
-            rem_n = n - inp.io_months
-            pmt = rm*opening/(1-(1+rm)**(-rem_n)) if rm > 0 else opening/rem_n
-            principal = min(opening, pmt - interest)
-        else:
-            principal = 0.0
-        ds[i] = interest + principal
-        closing = opening + draw - principal
-        bal[i] = closing
-        open_bal = closing
+        denom = mf_egi[i] + rt_egi[i]
+        sh = mf_egi[i]/denom if denom else 0.0
+        mf_noi[i] = mf_egi[i] + (opex_excl[i] + tax_m[i])*sh
+        rt_noi[i] = rt_egi[i] + (opex_excl[i] + tax_m[i])*((1 - sh) if denom else 0.0)
 
-    # ---- Levered & unlevered cash flows ----
+    # ---- Financed capital draw, pro-rata as spent ----
+    fin_draw = [0.0]*MAX_MONTHS
+    for i in range(MAX_MONTHS):
+        fin_draw[i] = sum(amt/months for (amt, fund, start, months) in buckets
+                          if fund == "Financed" and start <= i < start + months)
+
+    # ---- Debt sizing: blended + per-leg, min-of, iterate for financing-cost circularity ----
+    going_in = sum(noi[1:13]); stab = sum(noi[13:25])
+    gi_mf, gi_rt = sum(mf_noi[1:13]), sum(rt_noi[1:13])
+    blended_rate = inp.fixed_rate if inp.loan_rate_type == "Fixed" else inp.sofr + inp.spread_bps/10000
+    def dconst(rt_, amort):
+        rmm, nn = rt_/12, amort*12
+        return (rmm/(1-(1+rmm)**(-nn)))*12 if rmm > 0 else 1
+    dc_bl, dc_mf, dc_rt = dconst(blended_rate, inp.amort_years), dconst(inp.mf_loan_rate, inp.amort_years), dconst(inp.rt_loan_rate, inp.amort_years)
+    BIG = 1e15
+    def size(value, cost, noi_gi, dc):
+        cons = {"LTV": value*inp.max_ltv if inp.use_ltv else BIG,
+                "LTC": cost*inp.max_ltc if inp.use_ltc else BIG,
+                "DSCR": noi_gi/(inp.min_dscr*dc) if inp.use_dscr else BIG,
+                "Debt Yield": noi_gi/inp.min_dy if inp.use_dy else BIG}
+        return min(cons.values()), min(cons, key=cons.get)
+    sep = (inp.debt_structure == "Separate MF + Retail Loans")
+    val_mf = price*(gi_mf/going_in) if going_in else 0.0
+    val_rt = price - val_mf
+    loan_amt = fin_cost = 0.0
+    bind_bl = bind_mf = bind_rt = ""
+    loanA = loanB = blended_loan = mf_loan = rt_loan = 0.0
+    for _ in range(10):
+        total_cost = price + price*inp.closing_pct + total_cap + fin_cost
+        cost_mf = total_cost*(gi_mf/going_in) if going_in else 0.0
+        cost_rt = total_cost - cost_mf
+        blended_loan, bind_bl = size(price, total_cost, going_in, dc_bl)
+        mf_loan, bind_mf = size(val_mf, cost_mf, gi_mf, dc_mf)
+        rt_loan, bind_rt = size(val_rt, cost_rt, gi_rt, dc_rt)
+        loanA = mf_loan if sep else blended_loan
+        loanB = rt_loan if sep else 0.0
+        property_loan = loanA + loanB
+        loan_amt = property_loan + financed_cap
+        fin_cost = ((mf_loan + rt_loan) if sep else blended_loan)*inp.finance_cost_pct + financed_cap*inp.finance_cost_pct
+    total_cost = price + price*inp.closing_pct + total_cap + fin_cost
+    binding = f"MF:{bind_mf} / RT:{bind_rt}" if sep else bind_bl
+    rateA = inp.mf_loan_rate if sep else blended_rate
+    rateB = inp.rt_loan_rate if sep else blended_rate
+
+    # ---- Two-leg monthly schedule (Loan A primary takes financed draws; B inert when single) ----
+    def leg(amount, rate, io, amort, primary):
+        rmm, nn = rate/12, amort*12
+        ob = 0.0; ds_ = [0.0]*MAX_MONTHS; cl = [0.0]*MAX_MONTHS; dr = [0.0]*MAX_MONTHS
+        for i in range(MAX_MONTHS):
+            opening = ob
+            draw = amount if i == 0 else (fin_draw[i] if primary else 0.0)
+            interest = opening*rmm*active[i]
+            if active[i] and i > io and opening > 0:
+                rem = nn - io
+                pmt = rmm*opening/(1-(1+rmm)**(-rem)) if rmm > 0 else opening/rem
+                principal = min(opening, pmt - interest)
+            else:
+                principal = 0.0
+            closing = opening + draw - principal
+            ds_[i], dr[i], cl[i] = interest + principal, draw, closing
+            ob = closing
+        return ds_, dr, cl
+    dsA, drA, clA = leg(loanA, rateA, inp.io_months, inp.amort_years, True)
+    dsB, drB, clB = leg(loanB, rateB, inp.io_months, inp.amort_years, False)
+    ds = [dsA[i] + dsB[i] for i in range(MAX_MONTHS)]
+    draws = [drA[i] + drB[i] for i in range(MAX_MONTHS)]
+    bal = [clA[i] + clB[i] for i in range(MAX_MONTHS)]
+
+    # ---- Exit ----
     lcf = [0.0]*MAX_MONTHS; ucf = [0.0]*MAX_MONTHS
-    # exit
     exit_idx = max(i for i in range(MAX_MONTHS) if active[i] == 1)
-    # exit NOI trailing 12 (idx in (hold-12, hold])
     trailing = sum(noi[i] for i in range(MAX_MONTHS) if hold_months-12 < i <= hold_months)
     forward = trailing*(1+inp.vec_mfrent[0])
     exit_noi = trailing if inp.exit_noi_basis == "Trailing 12-mo" else forward
@@ -304,15 +348,14 @@ def engine(inp: Inputs, price: float):
     else:
         exit_val = exit_noi/inp.exit_cap_blended
 
-    equity = total_cost - loan_amt   # S&U plug: uses (incl. all capital) - loan proceeds
+    # ---- Levered & unlevered cash flows ----
+    equity = total_cost - loan_amt   # S&U plug: uses (incl. all capital) - committed loan
     for i in range(MAX_MONTHS):
-        ucf_ops = noi[i] + reserves[i] + capex[i]   # capex[] carries all capital spend over time
-        lev = ucf_ops - ds[i]
+        ucf_ops = noi[i] + reserves[i] + capex[i]
+        lev = ucf_ops - ds[i] + draws[i]   # draws: property loan at m0 + financed holdback over time
         if i == 0:
-            # acquisition basis + financing costs out; loan proceeds (incl. financed holdback) in.
-            # Capital (equity- and loan-funded) flows through capex[] over time -> no double count.
-            lev += -(price + price*inp.closing_pct + fin_cost) + loan_amt
-            ucf[i] = ucf_ops - (price + price*inp.closing_pct)   # unlevered: no debt, no fin cost
+            lev += -(price + price*inp.closing_pct + fin_cost)
+            ucf[i] = ucf_ops - (price + price*inp.closing_pct)
         else:
             ucf[i] = ucf_ops
         if i == exit_idx:
@@ -326,11 +369,68 @@ def engine(inp: Inputs, price: float):
     u_irr = xirr(ucf, dates)
     em = (sum(x for x in lcf if x > 0)/max(1.0, -sum(x for x in lcf if x < 0)))
     yoc = stab/total_cost if total_cost else 0
-    return dict(noi=noi, lcf=lcf, ucf=ucf, irr=irr, u_irr=u_irr, em=em,
+    wf = waterfall(lcf, dates, inp)
+    return dict(noi=noi, lcf=lcf, ucf=ucf, irr=irr, u_irr=u_irr, em=em, wf=wf,
                 loan=loan_amt, binding=binding, going_in=going_in, stab=stab,
                 total_cost=total_cost, equity=equity, exit_val=exit_val,
                 yoc=yoc, dev_spread=(yoc-inp.exit_cap_blended), exit_idx=exit_idx,
-                mf_egi=mf_egi, rt_egi=rt_egi, hold_months=hold_months)
+                mf_egi=mf_egi, rt_egi=rt_egi, hold_months=hold_months,
+                mf_noi=mf_noi, rt_noi=rt_noi, loanA=loanA, loanB=loanB,
+                blended_loan=blended_loan, mf_loan=mf_loan, rt_loan=rt_loan,
+                property_loan=loanA+loanB, draws=draws, ds=ds, bal=bal)
+
+def waterfall(lcf, dates, inp):
+    """Period-by-period American waterfall mirroring the Excel monthly engine.
+    ROC -> compounded pref -> GP catch-up -> residual split by IRR hurdle.
+    Conserves: SUM(lp_cf)+SUM(gp_cf) == SUM(lcf)."""
+    t = MI.CARRY_TIERS
+    (h12, lpA, gpA), (h15, lpB, gpB), (_, lpC, gpC) = t[1], t[2], t[3]
+    pref_m = (1+inp.pref_rate)**(1/12) - 1
+    h12m = (1+h12)**(1/12) - 1
+    h15m = (1+h15)**(1/12) - 1
+    gp_split = 1 - inp.lp_split
+    lp_frac = inp.lp_split + gp_split*(1 - inp.gp_coinvest)
+    gpco_frac = gp_split*inp.gp_coinvest
+    no = (inp.lp_present == "No")
+    unret = prefb = acc12 = acc15 = invc = cump = cumc = 0.0
+    lp_cf = [0.0]*len(lcf); gp_cf = [0.0]*len(lcf)
+    lp_dist = gp_dist = gp_promote = 0.0
+    for i, l in enumerate(lcf):
+        con, dist = max(0.0, -l), max(0.0, l)
+        pacr = (unret + prefb)*pref_m
+        roc = min(dist, unret + con)
+        pref = min(dist - roc, prefb + pacr)
+        if inp.gp_catchup_on:
+            need = max(0.0, (gpA/lpA)*(cump + pref) - cumc)
+            catch = min(dist - roc - pref, need/max(inp.catchup_pct, 1e-6))
+        else:
+            catch = 0.0
+        cgp, cinv = catch*inp.catchup_pct, catch*(1 - inp.catchup_pct)
+        acc12 = acc12*(1 + h12m) + con
+        acc15 = acc15*(1 + h15m) + con
+        rem3 = dist - roc - pref - catch
+        invsf0 = invc + roc + pref + cinv
+        tA = min(rem3, max(0.0, acc12 - invsf0)/lpA)
+        tB = min(rem3 - tA, max(0.0, acc15 - (invsf0 + lpA*tA))/lpB)
+        tC = rem3 - tA - tB
+        invd = roc + pref + cinv + lpA*tA + lpB*tB + lpC*tC
+        gppr = cgp + gpA*tA + gpB*tB + gpC*tC
+        unret += con - roc
+        prefb += pacr - pref
+        invc += invd
+        cump += pref
+        cumc += cgp
+        if no:
+            lp_cf[i], gp_cf[i] = 0.0, l
+            gp_dist += dist
+        else:
+            lp_amt = invd*lp_frac
+            gp_amt = invd*gpco_frac + gppr
+            lp_cf[i] = -con*lp_frac + lp_amt
+            gp_cf[i] = -con*gpco_frac + gp_amt
+            lp_dist += lp_amt; gp_dist += gp_amt; gp_promote += gppr
+    return dict(lp_cf=lp_cf, gp_cf=gp_cf, lp_dist=lp_dist, gp_dist=gp_dist,
+                gp_promote=gp_promote, lp_irr=xirr(lp_cf, dates), gp_irr=xirr(gp_cf, dates))
 
 def xirr(cfs, dates, guess=0.1):
     pts = [(dates[i], cfs[i]) for i in range(len(cfs)) if abs(cfs[i]) > 1e-9]
@@ -431,6 +531,20 @@ def run_tests():
           f"{b['loan']:.0f} -> {bt['loan']:.0f}")
     check("4 Min-of debt: binding flag = DSCR when tight", bt["binding"] == "DSCR", bt["binding"])
 
+    # 4b. Separate MF + Retail loans size independently and flow through
+    sepi = replace(base, debt_structure="Separate MF + Retail Loans")
+    bs = engine(sepi, sepi.input_price)
+    check("4b Separate loans: property loan = MF leg + Retail leg",
+          abs(bs["property_loan"] - (bs["mf_loan"] + bs["rt_loan"])) < 1,
+          f"prop={bs['property_loan']:.0f} MF={bs['mf_loan']:.0f} RT={bs['rt_loan']:.0f}")
+    check("4b Separate loans: both legs sized > 0",
+          bs["mf_loan"] > 0 and bs["rt_loan"] > 0, f"MF={bs['mf_loan']:.0f} RT={bs['rt_loan']:.0f}")
+    check("4b Separate loans: total loan differs from blended (distinct structure)",
+          abs(bs["loan"] - b["loan"]) > 1, f"sep={bs['loan']:.0f} blended={b['loan']:.0f}")
+    check("4b Separate loans: sources = uses still ties",
+          abs((bs["loan"] + bs["equity"]) - bs["total_cost"]) < 1.0, "")
+    check("4b Separate loans: IRR finite", bs["irr"] == bs["irr"], f"IRR={bs['irr']:.4f}")
+
     # 5. Price-solver round-trip — solve target IRR, feed back, reproduce
     solved = solve_max_bid(base, 0.15)
     check("5 Price solver: found a price", solved is not None, f"price={solved}")
@@ -444,6 +558,19 @@ def run_tests():
     no  = engine(replace(base, lp_present="No"), base.input_price)
     check("6 LP toggle: project levered IRR unchanged by LP/GP split",
           abs(yes["irr"] - no["irr"]) < 1e-9, f"{yes['irr']:.5f} vs {no['irr']:.5f}")
+    check("6 LP toggle (No): LP distributions = 0, GP gets all",
+          no["wf"]["lp_dist"] == 0 and abs(no["wf"]["gp_irr"] - no["irr"]) < 1e-6,
+          f"GP IRR={no['wf']['gp_irr']:.4f} proj={no['irr']:.4f}")
+    check("6 LP toggle (Yes): promote > 0 and LP IRR < project IRR (carry to GP)",
+          yes["wf"]["gp_promote"] > 0 and yes["wf"]["lp_irr"] < yes["irr"],
+          f"promote=${yes['wf']['gp_promote']:,.0f} LP IRR={yes['wf']['lp_irr']:.4f}")
+
+    # 6b. Waterfall conservation: SUM(LP CF) + SUM(GP CF) == project levered CF (Yes & No)
+    for tag, e in (("Yes", yes), ("No", no)):
+        tot = sum(e["lcf"])
+        split = sum(e["wf"]["lp_cf"]) + sum(e["wf"]["gp_cf"])
+        check(f"6b Waterfall conserves cash (LP Present={tag})",
+              abs(split - tot) < 1.0, f"split={split:,.0f} proj={tot:,.0f}")
 
     # 7. Fee removal — turning fees off lowers cost / changes equity cleanly (proxy via cost)
     fee_off = replace(base, acq_fee_on=False, am_fee_on=False, disp_fee_on=False)
@@ -456,6 +583,10 @@ def run_tests():
            (base.cap_repairs + base.reno_cost_unit*len(base.mf_units) + base.cap_tilc + base.cap_contingency) + \
            b["loan"]*base.finance_cost_pct
     check("9 Balance: sources = uses", abs(sources - uses) < 1.0, f"S={sources:.0f} U={uses:.0f}")
+
+    # 9b. Component NOI: MF NOI + Retail NOI == total NOI every month
+    comp_ok = all(abs(b["mf_noi"][i] + b["rt_noi"][i] - b["noi"][i]) < 1e-6 for i in range(MAX_MONTHS))
+    check("9b Component NOI: MF + Retail = total NOI (every month)", comp_ok, "")
 
     return results
 

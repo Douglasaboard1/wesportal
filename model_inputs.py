@@ -46,6 +46,13 @@ OPEX_ITEMS = [
     ("Marketing", 250), ("Insurance", 600), ("Other", 300),
 ]
 
+# ---- Waterfall carry tiers: (IRR hurdle upper bound, LP %, GP %) ----
+CARRY_TIERS = [(0.08, 0.90, 0.10), (0.12, 0.80, 0.20), (0.15, 0.70, 0.30), (9.99, 0.60, 0.40)]
+
+# ---- PILOT / Abatement schedule: annual tax $ by hold year (Y1..Y11) ----
+PILOT_SCHEDULE = [200_000, 250_000, 300_000, 350_000, 400_000, 450_000,
+                  500_000, 550_000, 600_000, 650_000, 700_000]
+
 # ---- recovery matrix: structure -> (CAM, Tax, Insurance, base-year stop) ----
 RECOVERY_MATRIX = [
     ("NNN", 1, 1, 1, 0),
@@ -111,6 +118,7 @@ DEFAULTS = dict(
     max_ltv=0.65, max_ltc=0.70, min_dscr=1.25, min_dy=0.085,
     fixed_rate=0.0575, sofr=0.043, spread_bps=250.0, io_months=36,
     amort_years=30, finance_cost_pct=0.01,
+    mf_loan_rate=0.0560, rt_loan_rate=0.0625,   # per-leg rates for Separate mode
     refi_month=36, refi_cap=0.055, refi_ltv=0.65, refi_cost_pct=0.01,
     # waterfall
     lp_split=0.90, gp_coinvest=1.0, pref_rate=0.08, catchup_pct=0.50,

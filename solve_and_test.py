@@ -177,7 +177,7 @@ def engine(inp: Inputs, price: float):
     noi = [0.0]*MAX_MONTHS
 
     # capital buckets: (amount, funding, start, months)
-    reno_amt = inp.reno_cost_unit * units
+    reno_amt = inp.reno_cost_unit*units if inp.business_plan == "Value-Add" else 0.0
     buckets = [
         (inp.cap_repairs, inp.fund_repairs, 1, 6),
         (reno_amt, inp.fund_reno, 1, 24),
@@ -287,7 +287,10 @@ def engine(inp: Inputs, price: float):
                 "LTC": cost*inp.max_ltc if inp.use_ltc else BIG,
                 "DSCR": noi_gi/(inp.min_dscr*dc) if inp.use_dscr else BIG,
                 "Debt Yield": noi_gi/inp.min_dy if inp.use_dy else BIG}
-        return min(cons.values()), min(cons, key=cons.get)
+        mn = min(cons.values())
+        if value < mn:                        # value backstop: loan can't exceed asset value
+            return value, "Value cap"
+        return mn, min(cons, key=cons.get)
     sep = (inp.debt_structure == "Separate MF + Retail Loans")
     val_mf = price*(gi_mf/going_in) if going_in else 0.0
     val_rt = price - val_mf
@@ -377,7 +380,9 @@ def engine(inp: Inputs, price: float):
                 mf_egi=mf_egi, rt_egi=rt_egi, hold_months=hold_months,
                 mf_noi=mf_noi, rt_noi=rt_noi, loanA=loanA, loanB=loanB,
                 blended_loan=blended_loan, mf_loan=mf_loan, rt_loan=rt_loan,
-                property_loan=loanA+loanB, draws=draws, ds=ds, bal=bal)
+                property_loan=loanA+loanB, draws=draws, ds=ds, bal=bal,
+                total_cap=total_cap, fin_cost=fin_cost, financed_cap=financed_cap,
+                equity_cap=equity_cap, going_in_mf=gi_mf, going_in_rt=gi_rt)
 
 def waterfall(lcf, dates, inp):
     """Period-by-period American waterfall mirroring the Excel monthly engine.
@@ -462,29 +467,30 @@ def solve_max_bid(inp: Inputs, target_irr: float):
     holdback can exceed the purchase basis (negative equity -> all-positive flows
     -> nan IRR); we lift the lower bound past that degenerate region first.
     """
-    def f(p):
+    # g(p) = (IRR at price p) - target. IRR decreases monotonically with price; at very
+    # high prices it becomes nan (returns worse than -99%), which is unambiguously *below*
+    # any positive target, so treat nan as below-target. This keeps the bracket valid and
+    # the true root (in the finite region) is found cleanly.
+    def g(p):
         v = engine(inp, p)["irr"]
-        return v - target_irr if v == v else float("nan")
-    lo, hi = 20_000_000.0, 150_000_000.0
-    # lift lo until f(lo) is a valid, positive number (price low enough to beat target)
+        return (v - target_irr) if v == v else -1.0
+    lo, hi = 5_000_000.0, 250_000_000.0
     tries = 0
-    while (f(lo) != f(lo) or f(lo) <= 0) and lo < hi and tries < 20:
-        lo += 5_000_000.0
+    while g(lo) <= 0 and lo < hi and tries < 50:      # lift lo until it beats the target
+        lo += 3_000_000.0
         tries += 1
-    flo, fhi = f(lo), f(hi)
-    if flo != flo or fhi != fhi or flo*fhi > 0:
+    if g(lo) <= 0 or g(hi) > 0:                        # target unreachable in range
         return None
-    for _ in range(80):
-        mid = (lo+hi)/2
-        fm = f(mid)
-        if abs(fm) < 1e-5:
+    for _ in range(90):
+        mid = (lo + hi)/2
+        gm = g(mid)
+        if abs(gm) < 1e-6 and engine(inp, mid)["irr"] == engine(inp, mid)["irr"]:
             return mid
-        # IRR decreases as price increases -> f decreasing
-        if fm > 0:
+        if gm > 0:
             lo = mid
         else:
             hi = mid
-    return (lo+hi)/2
+    return (lo + hi)/2
 
 # --------------------------------------------------------------------------------------
 # SECTION 8 ACCEPTANCE TESTS

@@ -14,7 +14,9 @@ interactive Goal-Seek solver, conditional formatting, and print polish.
 | `build_model.py` | Writes `MixedUse_Acquisition_Model.xlsx`: 13 tabs, every formula as a real cell-formula string, 178 named ranges, fonts by role, iterative calc on. |
 | `solve_and_test.py` | A reduced-form numeric replica of the engine used to (1) binary-search the max-bid price and write it into the `SolvedPrice` cell, and (2) run the Section 8 assertions + a structural validation of the workbook. |
 | `phase2_finish.py` | Phase 2 finishing pass applied with openpyxl: populates the three Sensitivities grids and a max-bid table with computed values, adds conditional formatting on status cells, and sets print areas / fit-to-page / freeze panes. |
-| `run_build.sh` | Runs the three scripts in order (build → solve+test → Phase 2 finish). |
+| `scenarios.py` | End-to-end scenario sweep: runs 38 mock deals × toggle combinations through the engine and asserts a battery of invariants (cash conservation, sources=uses, component-NOI, loan bounds, LP/GP behaviour) on each. |
+| `validate_excel.py` | Independent cross-check: evaluates the **actual Excel formulas** with the third-party `formulas` engine (circular-ref aware) and compares every headline output, and the full monthly levered-CF row, to the Python replica. |
+| `run_build.sh` | Runs build → solve+test → Phase 2 finish → scenario sweep. |
 | `MixedUse_Acquisition_Model.xlsx` | The generated workbook (the Phase-1 deliverable). |
 
 ## Run

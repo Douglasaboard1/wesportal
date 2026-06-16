@@ -193,7 +193,7 @@ put(cp, r, 2, MI.ACQ_DATE, role="input", nf=NF_DATE, fill=FILL_INPUT, name="Acqu
 put(cp, r, 1, "Disposition Date", role="form")
 put(cp, r, 2, MI.DISP_DATE, role="input", nf=NF_DATE, fill=FILL_INPUT, name="DispositionDate"); r += 1
 put(cp, r, 1, "Hold (months)", role="form")
-put(cp, r, 2, "=DATEDIF(AcquisitionDate,DispositionDate,\"m\")", role="form", nf=NF_NUM, name="HoldMonths"); r += 1
+put(cp, r, 2, "=(YEAR(DispositionDate)-YEAR(AcquisitionDate))*12+MONTH(DispositionDate)-MONTH(AcquisitionDate)", role="form", nf=NF_NUM, name="HoldMonths"); r += 1
 put(cp, r, 1, "Hold (years)", role="form")
 put(cp, r, 2, "=HoldMonths/12", role="form", nf='0.0', name="HoldYears"); r += 2
 
@@ -934,7 +934,9 @@ for k,(nm,amt,fund,start,months) in enumerate(buckets):
     rr = CB0 + k
     put(cx, rr, 1, nm, role="input", fill=FILL_INPUT)
     if amt is None:
-        put(cx, rr, 2, "=RenoCostUnit*MF_UnitCount", role="form", nf=NF_USD0)
+        # Unit-renovation capital only funds in Value-Add mode (no reno otherwise).
+        put(cx, rr, 2, '=IF(BusinessPlanMode="Value-Add",RenoCostUnit*MF_UnitCount,0)',
+            role="form", nf=NF_USD0)
     else:
         put(cx, rr, 2, amt, role="input", nf=NF_USD0, fill=FILL_INPUT)
     put(cx, rr, 3, fund, role="form")
@@ -1072,17 +1074,20 @@ put(db, r, 2, "=TotalCost-Cost_MF", role="form", nf=NF_USD0, name="Cost_Retail")
 def size_leg(prefix, value_ref, cost_ref, noi_ref, maxltv, maxltc, mindscr, mindy, dconst, loanname):
     global r
     put(db, r, 1, f"{prefix}: max loan — LTV", role="form")
-    put(db, r, 2, f'=IF(Use_LTV="On",{value_ref}*{maxltv},1E15)', role="form", nf=NF_USD0, name=prefix+"_LTV"); r += 1
+    put(db, r, 2, f'=IF(Use_LTV="On",{value_ref}*{maxltv},1000000000000000)', role="form", nf=NF_USD0, name=prefix+"_LTV"); r += 1
     put(db, r, 1, f"{prefix}: max loan — LTC", role="form")
-    put(db, r, 2, f'=IF(Use_LTC="On",{cost_ref}*{maxltc},1E15)', role="form", nf=NF_USD0, name=prefix+"_LTC"); r += 1
+    put(db, r, 2, f'=IF(Use_LTC="On",{cost_ref}*{maxltc},1000000000000000)', role="form", nf=NF_USD0, name=prefix+"_LTC"); r += 1
     put(db, r, 1, f"{prefix}: max loan — DSCR", role="form")
-    put(db, r, 2, f'=IF(Use_DSCR="On",{noi_ref}/({mindscr}*{dconst}),1E15)', role="form", nf=NF_USD0, name=prefix+"_DSCRcap"); r += 1
+    put(db, r, 2, f'=IF(Use_DSCR="On",{noi_ref}/({mindscr}*{dconst}),1000000000000000)', role="form", nf=NF_USD0, name=prefix+"_DSCRcap"); r += 1
     put(db, r, 1, f"{prefix}: max loan — Debt Yield", role="form")
-    put(db, r, 2, f'=IF(Use_DY="On",{noi_ref}/{mindy},1E15)', role="form", nf=NF_USD0, name=prefix+"_DYcap"); r += 1
+    put(db, r, 2, f'=IF(Use_DY="On",{noi_ref}/{mindy},1000000000000000)', role="form", nf=NF_USD0, name=prefix+"_DYcap"); r += 1
     put(db, r, 1, f"{prefix}: loan (MIN of active)", role="sub")
-    put(db, r, 2, f"=MIN({prefix}_LTV,{prefix}_LTC,{prefix}_DSCRcap,{prefix}_DYcap)", role="form", nf=NF_USD0, bold=True, name=loanname); r += 1
+    # Backstop: a loan can never exceed asset value, so cap the min-of at the value.
+    # This also makes "all constraints off" resolve sanely (100% of value) instead of infinity.
+    put(db, r, 2, f"=MIN({prefix}_LTV,{prefix}_LTC,{prefix}_DSCRcap,{prefix}_DYcap,{value_ref})",
+        role="form", nf=NF_USD0, bold=True, name=loanname); r += 1
     put(db, r, 1, f"{prefix}: binding constraint", role="form")
-    put(db, r, 2, f'=IF({loanname}={prefix}_LTV,"LTV",IF({loanname}={prefix}_LTC,"LTC",IF({loanname}={prefix}_DSCRcap,"DSCR","Debt Yield")))',
+    put(db, r, 2, f'=IF({loanname}={prefix}_LTV,"LTV",IF({loanname}={prefix}_LTC,"LTC",IF({loanname}={prefix}_DSCRcap,"DSCR",IF({loanname}={prefix}_DYcap,"Debt Yield","Value cap"))))',
         role="form", name=prefix+"_Binding"); r += 1
     r += 1
 

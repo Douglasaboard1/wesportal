@@ -99,6 +99,27 @@ Toggle integrity · retail-to-zero · date-driven hold · min-of debt binding ·
 also scans all ~14,300 formula cells for `#REF!`, unresolved name tokens, and doubled
 sheet qualifiers.
 
+## Verification (three independent layers)
+
+1. **Structural** — every formula scanned: 0 `#REF!`, all 241 named tokens resolve, no
+   doubled sheet qualifiers (~14k formulas).
+2. **Replica** — a Python mirror of the engine runs the **Section 8 acceptance tests
+   (24/24)** and a **38-scenario sweep** (`scenarios.py`) covering every toggle, mix,
+   debt structure, tax method, exit method, fee, and growth/rate stress; each scenario
+   asserts cash conservation, sources=uses, component-NOI, loan bounds, and LP/GP
+   behaviour. All pass.
+3. **Independent Excel engine** (`validate_excel.py`) — the *actual* `.xlsx` formulas are
+   evaluated by the third-party `formulas` library and compared to the replica:
+   **14/14 headline metrics match to the cent, and the 120-month levered-cash-flow row
+   matches to $0.00.**
+
+This third layer earned its keep: it caught a real bug the first two missed — a growth-
+factor `INDEX(...)` whose year-index argument was written without its `Assumptions!`
+sheet qualifier, so on the revenue tabs it read the wrong cell and returned `#REF!` (the
+replica computed growth independently, so it never saw it). Fixed. (Note: the `formulas`
+library can't do iterative calc or `SUMPRODUCT(--())`; the validator breaks the single
+financing-cost cycle to make the workbook acyclic, and the model uses `SUMIFS`.)
+
 ## Waterfall interpretation (documented choice)
 
 The spec's tier table is ambiguous in the pref region. The model implements the

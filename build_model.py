@@ -466,11 +466,12 @@ r += 1
 ASM = "Assumptions"
 add_name("PeriodDateRow", ASM, f"${get_column_letter(M0)}${PERIOD_DATE_ROW}")  # anchor only
 
-# Helper to reference a cumulative growth factor for month i (returns formula fragment)
+# Helper to reference a cumulative growth factor for month i (returns formula fragment).
+# The year-column-index helper lives on the Assumptions tab, so it MUST be sheet-qualified
+# (this fragment is embedded in formulas written on MF/Retail/OpEx tabs).
 def cum_factor_ref(cum_name, i):
     col = mcol(i)
-    # cum vector spans D..O (cols 4..15). Use INDEX with the year-col-ref helper.
-    return f"INDEX({cum_name},1,{col}${YEAR_COLREF_ROW})"
+    return f"INDEX({cum_name},1,{q(ASM)}!{col}${YEAR_COLREF_ROW})"
 
 # ======================================================================================
 # TAB 4 — MF REVENUE (unit-by-unit rent roll -> monthly EGI)

@@ -1684,24 +1684,24 @@ for i2,cp_ in enumerate(cap_axis):
     put(se, 11 + i2, 1, cp_, role="input", nf=NF_PCT2, fill=FILL_INPUT)
     for j in range(len(growth_axis)):
         put(se, 11 + i2, 2 + j, "", role="form")  # Phase 2 fills via Data Table
-put(se, 17, 1, "Row input cell -> ExitCapBlended ; Column input cell -> Vec_MFRent Y1", role="unit")
+put(se, 17, 1, "DATA TABLE inputs:  Row input cell = Assumptions!$E$56 (MF rent growth Y1) ;  Column input cell = ExitCapBlended (Assumptions!$B$13)", role="unit")
 
 # Grid 2: purchase price x exit cap -> IRR & EM
 put(se, 19, 1, "Grid 2: Purchase price (rows) x exit cap (cols) -> Levered IRR", role="sub")
 put(se, 20, 1, "=Sens_LIRR", role="link", nf=NF_PCT2)
-price_axis = [55e6,58e6,62e6,66e6,70e6]
+price_axis = [40e6,44e6,48e6,52e6,56e6]
 for j,cp_ in enumerate(cap_axis):
     put(se, 20, 2 + j, cp_, role="input", nf=NF_PCT2, fill=FILL_INPUT, align="center")
 for i2,p in enumerate(price_axis):
     put(se, 21 + i2, 1, p, role="input", nf=NF_USD0, fill=FILL_INPUT)
-put(se, 27, 1, "Row input -> InputPrice ; Column input -> ExitCapBlended", role="unit")
+put(se, 27, 1, "DATA TABLE inputs:  Row input cell = ExitCapBlended (Assumptions!$B$13) ;  Column input cell = InputPrice (Assumptions!$B$6)", role="unit")
 
 # Grid 3: one-way disposition date -> IRR/EM
 put(se, 29, 1, "Grid 3 (one-way): Disposition date -> Levered IRR & EM", role="sub")
 put(se, 30, 1, "Disp date", role="sub"); put(se, 30, 2, "=Sens_LIRR", role="link", nf=NF_PCT2); put(se,30,3,"=Sens_EM", role="link", nf=NF_MULT)
 for k in range(5):
     put(se, 31 + k, 1, f"=EDATE(DispositionDate,{(k-2)*12})", role="form", nf=NF_DATE)
-put(se, 37, 1, "Column input -> DispositionDate", role="unit")
+put(se, 37, 1, "DATA TABLE input (one-variable, dates run down the column):  Column input cell = DispositionDate (Control Panel!$B$9)", role="unit")
 
 # ======================================================================================
 # TAB 13 — IC ONE-PAGER
